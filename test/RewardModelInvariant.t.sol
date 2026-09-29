@@ -25,6 +25,7 @@ contract RewardModelHandler is Test {
     uint256 public fundedRewards;
     uint256 public fundedResources;
     uint256 public granted;
+    uint256 public consumed;
     uint256 public burned;
     uint256 public queued;
     uint256 public successfulClaims;
@@ -169,6 +170,8 @@ contract RewardModelHandler is Test {
             registry.levelUp(plots[i]);
             ++levels[i];
             resources[i] -= cost;
+            consumed += cost;
+            burned += cost * 1 ether;
             ++successfulLevels;
         }
     }
@@ -308,14 +311,48 @@ contract RewardModelInvariantTest is Test {
         assertEq(handler.levels(0), 20);
         assertGt(handler.successfulClaims(), 0);
         assertEq(handler.successfulLevels(), 19);
+        assertEq(handler.consumed(), 286_900, "total resource cost of levels 2 through 20");
         assertGt(handler.rejectedCalls(), 0);
         assertEq(handler.heartbeats(), 1);
+    }
+
+    function testModelTracksConsumptionWithoutReplenishingTheGrantPot() public {
+        // setUp already upgraded the first city once, consuming 400 resources.
+        _assertModel();
+        assertEq(handler.consumed(), 400);
+        uint256 pot = registry.resourcePot();
+        uint256 supply = token.totalSupply();
+        handler.level(0); // Level 2 -> 3 consumes another 900 resources.
+        _assertModel();
+        assertEq(handler.consumed(), 1300);
+        assertEq(token.totalSupply(), supply - 900 ether);
+        assertEq(registry.resourcePot(), pot, "consumption never refunds the grant pot");
+
+        handler.grant(1, 300_000);
+        handler.grant(2, 300_000);
+        handler.grant(0, 100_000);
+        _assertModel();
+        assertEq(registry.resourcePot(), 0);
+
+        handler.level(1);
+        _assertModel();
+        assertEq(handler.consumed(), 1700);
+        uint256 rejected = handler.rejectedCalls();
+        uint256 granted = handler.granted();
+        supply = token.totalSupply();
+        handler.grant(1, 1); // Burned backing cannot be awarded again.
+        handler.heartbeat(0, 1);
+        _assertModel();
+        assertEq(handler.rejectedCalls(), rejected + 2);
+        assertEq(handler.granted(), granted);
+        assertEq(token.totalSupply(), supply, "failed grants cannot burn backing");
     }
 
     function _assertModel() private view {
         uint256 totalPaid;
         uint256 weight;
         uint256 sold;
+        uint256 unspentResources;
         uint256 balances = token.balanceOf(address(handler)) + token.balanceOf(address(registry))
             + token.balanceOf(handler.OPERATOR());
         for (uint256 i; i < handler.N(); ++i) {
@@ -327,6 +364,7 @@ contract RewardModelInvariantTest is Test {
             assertEq(registry.cityOf(actor), expectedLevel == 0 ? 0 : plot + 1);
             assertEq(level, expectedLevel, "level follows only successful upgrades");
             assertEq(resources, handler.resources(i), "grants minus consumption");
+            unspentResources += handler.resources(i);
             if (level != 0) ++sold;
             weight += expectedLevel ** 2;
             uint256 paid = handler.paid(i);
@@ -348,8 +386,13 @@ contract RewardModelInvariantTest is Test {
         assertEq(registry.queuedRewards(), handler.queued());
         assertEq(registry.rewardsPool() + totalPaid, handler.fundedRewards(), "no missing reward deposits");
         assertEq(registry.resourcePot() + handler.granted() * 1 ether, handler.fundedResources());
-        assertEq(registry.allocatedResourceBacking(), handler.granted() * 1 ether);
-        assertEq(token.balanceOf(address(registry)), registry.rewardsPool() + handler.fundedResources());
+        assertEq(handler.granted(), unspentResources + handler.consumed(), "every resource is accounted for");
+        assertEq(registry.allocatedResourceBacking(), unspentResources * 1 ether);
+        assertEq(
+            token.balanceOf(address(registry)) + handler.consumed() * 1 ether,
+            registry.rewardsPool() + handler.fundedResources(),
+            "resource funding remains in custody or is burned on consumption"
+        );
         assertEq(balances, token.totalSupply(), "complete closed actor set conserves supply");
         assertEq(token.totalSupply() + handler.burned(), 1_000_000_000 ether);
         assertEq(handler.executor().paused(), handler.paused());

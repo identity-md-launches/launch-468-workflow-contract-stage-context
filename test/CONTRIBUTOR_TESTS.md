@@ -16,6 +16,14 @@ authorization, pause state, and heartbeat history. Expected failures are exercis
 inside the handler; any unexpected revert fails the campaign. A deterministic sequence
 reaches level 20, and each randomized sequence ends by attempting every owner's claim.
 
+The resource model now tracks consumption separately from cumulative grants, reflecting
+the accepted contract revision that burns backing on level-up. Unspent resources must
+equal allocated backing, and resource deposits must remain in custody or have been
+burned on consumption. The regression sequence checks these identities after upgrades,
+exhausts the grant pot, and verifies that burning allocated backing does not make it
+available for a second grant or heartbeat. Reaching level 20 consumes exactly 286,900
+resources. The reward oracle and its one-minor-unit rounding tolerance are unchanged.
+
 Run without writing build artifacts outside the permitted scratch directory:
 
 ```sh
