@@ -3,7 +3,7 @@
 Canonical compiler ABI arrays are in `abi/LaunchToken.json`, `abi/GrantExecutor.json`,
 and `abi/CityRegistry.json`. Regenerate with `python3 scripts/export_abi.py`; validate
 with `python3 scripts/export_abi.py --check`. Solidity NatSpec and README describe the
-economic assumptions and the unresolved universal-tax conflict.
+economic assumptions and the one-time registry binding.
 
 All token amounts are uint256 **minor GRID units (18 decimals)**. City IDs, levels, and
 resource amounts are uint256 integers. A resource amount of `400` means 400 resources,
@@ -11,9 +11,18 @@ requiring 400 GRID backing; it does not mean 400 token wei.
 
 ## LaunchToken
 
-Standard ERC-20 getters, `transfer`, `approve`, and `transferFrom` are fee-free.
+Standard ERC-20 getters and approvals retain their usual semantics. Every `transfer`
+and `transferFrom` pays the fixed `TAX_BPS() = 400`, with treasury `TREASURY()` fixed to
+`0x5b95A971B4583A5f011E9DA082acdD679b870D06`. `transferTax(gross)` returns the rounded-down
+tax. The recipient gets gross minus tax; allowances spend gross. `TaxTaken` comes from
+the token address and reports all four allocations, including any rounding dust.
 `burn(amount)` burns the caller's balance; `burnFrom(account, amount)` requires that
-account's allowance to the caller. No constructor arguments or administrative methods.
+account's allowance to the caller. Explicit burns have no transfer tax. No constructor
+arguments. `deployer()` may call `setCityRegistry(address)` exactly once with the reviewed
+registry; `cityRegistry()` is zero until then. `pendingRewards()` and `pendingResources()`
+report pool tax escrow collected before binding. Binding releases those amounts and has
+no token minting or arbitrary withdrawal capability. Verify and bind before opening the
+application; see README for the factory requirement and trust assumption.
 Applications must request the exact intended spend. In particular, never request an
 unlimited or oversized CityRegistry purchase allowance: it permits a higher live price
 to be burned after intervening buys. Zero ERC-20 transfers are allowed and zero-address
@@ -47,14 +56,14 @@ NFT interface exists. Built-in fixed-array getters reject indexes outside their 
 | --- | --- |
 | `buyCity(cityId)` | Unowned plot, caller has no city, >=1,000 GRID held; approve exactly the accepted quote to cap the burn |
 | `levelUp(cityId)` | Owner, below level 20, enough whole resources; consumes resources and burns their GRID backing atomically |
-| `claimRewards(cityId)` | Owner, at least one minor GRID unit accrued; returns amount paid |
+| `claimRewards(cityId)` | Owner, at least one minor GRID unit accrued; returns gross amount; token recipient receives net |
 | `fundRewards(amount)` | Any caller with balance/allowance; amount positive |
 | `fundResources(amount)` | Any caller with balance/allowance; amount positive |
-| `transferWithTax(to, amount)` | Optional taxed route only; positive gross amount and allowance, valid recipient |
+| `transferWithTax(to, amount)` | Single transferFrom wrapper; positive gross amount and allowance, valid recipient |
 | `grantResources(cityId, amount)` | Only immutable executor; owned city, positive grant, sufficient pot |
 | `recordHeartbeat(id1,a1,id2,a2,id3,a3)` | Only immutable executor; three distinct owned cities and sufficient pot for all |
 
-Approvals for buys/funding/optional transfers name **CityRegistry** as spender.
+Approvals for buys/funding/wrapped transfers name **CityRegistry** as spender.
 Approvals are not needed for claims, leveling, or executor awards.
 
 The frontend purchase flow is: read `cityPrice()`, display that exact minor-unit quote,
@@ -69,11 +78,19 @@ offer to revoke the remaining allowance with `approve(registry, 0)`. `buyCity` h
 separate price-limit parameter; the allowance supplies that limit. The frontend is a
 subsequent service deliverable and must implement this flow before release.
 
-For `transferWithTax`, show `fee = ceil(amount / 25)` and `net = amount - fee` before
-approval. Resources receive `floor(3 * fee / 10)`, burn and treasury each receive
-`floor(fee / 10)`, and rewards receive the remainder. A one-minor-unit gross amount
-delivers zero net. `TaxTaken` reports all rounded amounts. This optional route does not
-resolve the universal-tax release conflict described in README.
+For all token transfers, show `fee = floor(amount / 25)` and `net = amount - fee`.
+Resources receive `floor(3 * fee / 10)`, burn and treasury each receive `floor(fee / 10)`,
+and rewards receive the remainder. Amounts below 25 minor units pay zero rounded tax.
+`transferWithTax` uses this same token rule, without an additional levy. `fundRewards`
+and `fundResources` credit net funding plus the automatically allocated tax shares;
+`PoolsFunded` reports net explicit funding only. `TransferTaxReceived(rewards, resources)`
+reports the separate callback allocation. `onTaxReceived` accepts only the immutable
+token and is not a funding method for users. The callback is intentionally unguarded
+because it runs during guarded funding and claim operations, and makes no external calls.
+
+`claimableRewards`, `claimRewards`' return, and `RewardsClaimed.amount` are **gross**.
+A claim creates a taxed token transfer and can immediately credit new rewards to owners.
+Display the token net payout and any new claimable balance separately.
 
 ## GrantExecutor
 
@@ -91,9 +108,11 @@ two grant methods. Repeated pause/unpause transitions revert. No owner-transfer 
 | `ResourcesGranted` | Indexed city ID; whole resource amount |
 | `CityLeveled` | Indexed city ID; new level, resources consumed |
 | `RewardsClaimed` | Indexed city ID and owner; amount paid in minor GRID |
-| `TaxTaken` | Indexed sender and recipient; gross, fee, rewards, resources, burned, treasury, all minor GRID |
+| `TaxTaken` (LaunchToken) | Indexed sender and recipient; gross, fee, rewards, resources, burned, treasury, all minor GRID |
 | `HeartbeatRecorded` | Indexed sequence; fixed arrays of three IDs and whole resource amounts |
-| `PoolsFunded` | Indexed funder; reward and resource funding in minor GRID |
+| `PoolsFunded` | Indexed funder; net explicit reward/resource funding in minor GRID |
+| `TransferTaxReceived` | Registry pool credits from token tax (including escrow released at binding) |
+| `CityRegistrySet` | Token's permanently bound registry address |
 | `GrantsPauseChanged` | New boolean pause state |
 | `Transfer`, `Approval` | Standard ERC-20 logs, including zero-address burn destinations |
 

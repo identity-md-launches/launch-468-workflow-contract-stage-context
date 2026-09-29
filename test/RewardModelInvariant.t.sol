@@ -41,10 +41,12 @@ contract RewardModelHandler is Test {
         token = new LaunchToken();
         executor = new GrantExecutor(OPERATOR);
         registry = new CityRegistry(address(token), address(executor));
+        token.setCityRegistry(address(registry));
         token.approve(address(registry), type(uint256).max);
         for (uint256 i; i < N; ++i) {
             actors[i] = address(uint160(0xC17000 + i));
             token.transfer(actors[i], 10_000_000 ether);
+            _recordTax(10_000_000 ether);
             vm.prank(actors[i]);
             token.approve(address(registry), type(uint256).max);
         }
@@ -76,13 +78,15 @@ contract RewardModelHandler is Test {
         // Frequently exercise one wei and other sub-token amounts.
         uint256 amount = seed % 4 == 0 ? bound(seed, 1, 101) : bound(seed, 1, 100_000 ether);
         registry.fundRewards(amount);
-        _creditRewards(amount);
+        uint256 tax = _recordTax(amount);
+        _creditRewards(amount - tax);
     }
 
     function fundResources(uint256 seed) public {
         uint256 amount = bound(seed, 1, 1_000_000 ether);
         registry.fundResources(amount);
-        fundedResources += amount;
+        uint256 tax = _recordTax(amount);
+        fundedResources += amount - tax;
     }
 
     function taxedTransfer(uint256 seed, uint256 recipientSeed) public {
@@ -191,14 +195,11 @@ contract RewardModelHandler is Test {
         uint256 beforeBalance = token.balanceOf(actors[i]);
         vm.prank(actors[i]);
         uint256 amount = registry.claimRewards(plots[i]);
-        assertEq(amount, quote, "claim must pay its quote");
-        assertEq(token.balanceOf(actors[i]) - beforeBalance, amount, "actual payout");
+        assertEq(amount, quote, "claim returns its gross quote");
+        assertEq(token.balanceOf(actors[i]) - beforeBalance, amount - amount * 400 / 10_000, "net payout");
         paid[i] += amount;
         ++successfulClaims;
-        vm.expectRevert(CityRegistry.NoRewards.selector);
-        vm.prank(actors[i]);
-        registry.claimRewards(plots[i]);
-        ++rejectedCalls;
+        _recordTax(amount); // The payout redistributes its rewards share immediately.
     }
 
     function togglePause() public {
@@ -225,6 +226,16 @@ contract RewardModelHandler is Test {
         else if (operation == 5) executor.pause();
         else executor.unpause();
         ++rejectedCalls;
+    }
+
+    function _recordTax(uint256 amount) private returns (uint256 tax) {
+        tax = amount * 400 / 10_000;
+        uint256 resourceShare = tax * 30 / 100;
+        uint256 burnShare = tax * 10 / 100;
+        uint256 treasuryShare = tax * 10 / 100;
+        fundedResources += resourceShare;
+        burned += burnShare;
+        _creditRewards(tax - resourceShare - burnShare - treasuryShare);
     }
 
     function _creditRewards(uint256 amount) private {
@@ -332,7 +343,13 @@ contract RewardModelInvariantTest is Test {
         handler.grant(2, 300_000);
         handler.grant(0, 100_000);
         _assertModel();
-        assertEq(registry.resourcePot(), 0);
+        // Drain all remaining whole resources, including transfer-tax proceeds.
+        while (registry.resourcePot() >= 1 ether) {
+            uint256 remaining = registry.resourcePot() / 1 ether;
+            handler.grant(0, remaining > 300_000 ? 300_000 : remaining);
+        }
+        _assertModel();
+        assertLt(registry.resourcePot(), 1 ether);
 
         handler.level(1);
         _assertModel();
@@ -370,7 +387,7 @@ contract RewardModelInvariantTest is Test {
             uint256 paid = handler.paid(i);
             uint256 entitlement = paid + registry.claimableRewards(plot);
             // Different eager vs lazy division orders can straddle ONE minor unit.
-            // At depth 128, cumulative scaled rounding is <128*2400 << 1e27.
+            // At depth 128, including tax callbacks, scaled rounding is <3*128*2400 << 1e27.
             // Tolerance is independent of reward magnitude and number of claims.
             assertApproxEqAbs(
                 entitlement,

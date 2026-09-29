@@ -49,8 +49,13 @@ contract HostileGrid is ERC20, ERC20Burnable {
     }
 
     function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        if (failPayout) return false;
         if (callbackOn == 2) _attempt();
         return super.transferFrom(from, to, shortReceipt ? amount - 1 : amount);
+    }
+
+    function transferTax(uint256) external pure returns (uint256) {
+        return 0;
     }
 
     function burnFrom(address from, uint256 amount) public override {
@@ -150,13 +155,14 @@ contract AdversarialTest is Test {
         assertEq(owner, address(0));
     }
 
-    function testReentrantTaxBurnCannotRefillPools() public {
-        token.configure(registry, abi.encodeCall(registry.fundResources, (100e18)), 4);
+    function testReentrantForwardedTransferCannotRefillPools() public {
+        token.configure(registry, abi.encodeCall(registry.fundResources, (100e18)), 2);
         registry.transferWithTax(BOB, 1000e18);
         _assertGuard();
-        assertEq(registry.rewardsPool(), 20e18);
-        assertEq(registry.resourcePot(), 12e18);
-        assertEq(token.balanceOf(address(registry)), 32e18);
+        assertEq(registry.rewardsPool(), 0);
+        assertEq(registry.resourcePot(), 0);
+        assertEq(token.balanceOf(address(registry)), 0);
+        assertEq(token.balanceOf(BOB), 1000e18);
     }
 
     function testReentrantLevelBurnCannotConsumeResourcesTwice() public {
@@ -208,12 +214,12 @@ contract AdversarialTest is Test {
         assertEq(token.totalSupply(), supply - 400e18);
     }
 
-    function testRejectedRoundedTaxBurnRestoresPayoutPoolsAndAllowance() public {
+    function testRejectedForwardedTransferPreservesPayoutPoolsAndAllowance() public {
         uint256 balance = token.balanceOf(address(this));
         uint256 supply = token.totalSupply();
         token.approve(address(registry), 226);
-        token.setBurnFailure(true);
-        vm.expectRevert(HostileGrid.BurnRejected.selector);
+        token.setFailure(true, false);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(token)));
         registry.transferWithTax(BOB, 226);
         assertEq(token.balanceOf(address(this)), balance);
         assertEq(token.balanceOf(BOB), 0);
@@ -236,12 +242,10 @@ contract AdversarialTest is Test {
         assertEq(token.balanceOf(address(this)), beforeBalance);
     }
 
-    function testShortReceiptCannotCreateResourcesOrTaxRevenue() public {
+    function testShortReceiptCannotCreateResources() public {
         token.setFailure(false, true);
         vm.expectRevert(CityRegistry.UnexpectedTokenAmount.selector);
         registry.fundResources(100e18);
-        vm.expectRevert(CityRegistry.UnexpectedTokenAmount.selector);
-        registry.transferWithTax(BOB, 100e18);
         assertEq(registry.resourcePot(), 0);
         assertEq(registry.rewardsPool(), 0);
         assertEq(token.balanceOf(address(registry)), 0);
@@ -288,6 +292,10 @@ contract ConstructorFactory {
         }
         require(result.code.length != 0, "constructor failed");
     }
+
+    function bind(LaunchToken token, CityRegistry registry) external {
+        token.setCityRegistry(address(registry));
+    }
 }
 
 contract DeploymentTest is Test {
@@ -318,6 +326,10 @@ contract DeploymentTest is Test {
         assertEq(registry.treasury(), OPERATOR);
         assertEq(address(registry.grantExecutor()), address(executor));
         assertEq(address(registry.token()), address(token));
+        assertEq(token.deployer(), address(factory));
+        factory.bind(token, registry);
+        assertEq(token.cityRegistry(), address(registry));
+        assertEq(token.balanceOf(address(factory)), 1e27, "binding does not move launch supply");
         vm.prank(address(factory));
         vm.expectRevert(GrantExecutor.Unauthorized.selector);
         executor.pause();

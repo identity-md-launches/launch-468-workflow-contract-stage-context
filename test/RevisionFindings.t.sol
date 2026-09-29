@@ -33,13 +33,14 @@ contract RevisionFindingsTest is Test {
         token = new LaunchToken();
         executor = new GrantExecutor(OPERATOR);
         registry = new CityRegistry(address(token), address(executor));
-        token.transfer(ALICE, 1_000_000e18);
-        token.transfer(BOB, 1_000_000e18);
-        token.transfer(CAROL, 1_000_000e18);
+        token.setCityRegistry(address(registry));
+        deal(address(token), ALICE, 1_000_000e18);
+        deal(address(token), BOB, 1_000_000e18);
+        deal(address(token), CAROL, 1_000_000e18);
     }
 
-    /// @dev Evidence for the unresolved workflow/floor conflict, not universal-tax compliance.
-    function testOrdinaryTransferAndTransferFromCollectNoTax() public {
+    /// @dev Both standard routes must charge the approved levy and emit the token event.
+    function testOrdinaryTransferAndTransferFromCollectTax() public {
         uint256 supply = token.totalSupply();
         vm.recordLogs();
         vm.prank(ALICE);
@@ -48,20 +49,27 @@ contract RevisionFindingsTest is Test {
         token.approve(BOB, 1000e18);
         vm.prank(BOB);
         token.transferFrom(ALICE, address(0xD00E), 1000e18);
-        assertEq(token.balanceOf(RECIPIENT), 1000e18);
-        assertEq(token.balanceOf(address(0xD00E)), 1000e18);
+        assertEq(token.balanceOf(RECIPIENT), 960e18);
+        assertEq(token.balanceOf(address(0xD00E)), 960e18);
         assertEq(token.balanceOf(ALICE), 998_000e18);
         assertEq(token.allowance(ALICE, BOB), 0);
-        assertEq(registry.rewardsPool(), 0);
-        assertEq(registry.resourcePot(), 0);
-        assertEq(token.balanceOf(OPERATOR), 0);
-        assertEq(token.totalSupply(), supply);
+        assertEq(registry.rewardsPool(), 40e18);
+        assertEq(registry.resourcePot(), 24e18);
+        assertEq(token.balanceOf(OPERATOR), 8e18);
+        assertEq(token.totalSupply(), supply - 8e18);
+        assertEq(
+            registry.rewardsPool() + registry.resourcePot() + token.balanceOf(OPERATOR) + supply
+                - token.totalSupply(),
+            80e18
+        );
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 taxTopic =
             keccak256("TaxTaken(address,address,uint256,uint256,uint256,uint256,uint256,uint256)");
+        uint256 taxEvents;
         for (uint256 i; i < logs.length; ++i) {
-            assertNotEq(logs[i].topics[0], taxTopic);
+            if (logs[i].emitter == address(token) && logs[i].topics[0] == taxTopic) ++taxEvents;
         }
+        assertEq(taxEvents, 2);
     }
 
     /// @dev Negative integration example: an oversized allowance is not a quote bound.
@@ -102,7 +110,7 @@ contract RevisionFindingsTest is Test {
         assertEq(registry.soldPlots(), 1);
         assertEq(registry.totalWeight(), 1);
         assertEq(registry.accRewardPerWeight(), index);
-        assertEq(registry.claimableRewards(7), 100e18);
+        assertEq(registry.claimableRewards(7), 98e18);
         (address owner, uint256 level, uint256 resources,,) = registry.cities(5);
         assertEq(owner, address(0));
         assertEq(level, 0);
@@ -120,21 +128,21 @@ contract RevisionFindingsTest is Test {
         assertEq(registry.claimableRewards(5), 0);
     }
 
-    function testOptionalFeeBoundariesAllocateDustToRewards() public {
-        _assertTax(1, 1, 1, 0, 0, 0);
-        _assertTax(24, 1, 1, 0, 0, 0);
+    function testUniversalFeeBoundariesAllocateDustToRewards() public {
+        _assertTax(1, 0, 0, 0, 0, 0);
+        _assertTax(24, 0, 0, 0, 0, 0);
         _assertTax(25, 1, 1, 0, 0, 0);
-        _assertTax(26, 2, 2, 0, 0, 0);
+        _assertTax(26, 1, 1, 0, 0, 0);
         _assertTax(225, 9, 7, 2, 0, 0);
-        _assertTax(226, 10, 5, 3, 1, 1);
-        _assertTax(249, 10, 5, 3, 1, 1);
+        _assertTax(226, 9, 7, 2, 0, 0);
+        _assertTax(249, 9, 7, 2, 0, 0);
         _assertTax(250, 10, 5, 3, 1, 1);
         _assertTax(625, 25, 14, 7, 2, 2);
         _assertTax(1000e18, 40e18, 20e18, 12e18, 4e18, 4e18);
     }
 
     function testTinyFeeDustBecomesClaimableRewards() public {
-        _assertTax(24, 1, 1, 0, 0, 0);
+        _assertTax(25, 1, 1, 0, 0, 0);
         _buy(ALICE, 0);
         assertEq(registry.claimableRewards(0), 1);
         uint256 balance = token.balanceOf(ALICE);
@@ -153,7 +161,7 @@ contract RevisionFindingsTest is Test {
         vm.prank(OPERATOR);
         executor.grantResources(address(registry), 0, 1300);
         assertEq(token.totalSupply(), supply);
-        assertEq(registry.resourcePot(), 200e18);
+        assertEq(registry.resourcePot(), 158e18);
         assertEq(registry.allocatedResourceBacking(), 1300e18);
         vm.prank(ALICE);
         registry.levelUp(0);
@@ -161,7 +169,7 @@ contract RevisionFindingsTest is Test {
         assertEq(level, 2);
         assertEq(resources, 900);
         assertEq(registry.allocatedResourceBacking(), 900e18);
-        assertEq(token.balanceOf(address(registry)), 1100e18);
+        assertEq(token.balanceOf(address(registry)), 1088e18);
         assertEq(token.totalSupply(), supply - 400e18);
         vm.prank(ALICE);
         registry.levelUp(0);
@@ -169,18 +177,18 @@ contract RevisionFindingsTest is Test {
         assertEq(level, 3);
         assertEq(resources, 0);
         assertEq(registry.allocatedResourceBacking(), 0);
-        assertEq(registry.resourcePot(), 200e18);
-        assertEq(token.balanceOf(address(registry)), 200e18);
+        assertEq(registry.resourcePot(), 158e18);
+        assertEq(token.balanceOf(address(registry)), 188e18);
         assertEq(token.totalSupply(), supply - 1300e18);
-        assertEq(token.balanceOf(OPERATOR), 0);
+        assertEq(token.balanceOf(OPERATOR), 6e18);
     }
 
     function testHeartbeatBackingIsBurnedOnConsumptionForEachWinner() public {
         _buy(ALICE, 0);
         _buy(BOB, 1);
         _buy(CAROL, 2);
-        token.approve(address(registry), 1200e18);
-        registry.fundResources(1200e18);
+        token.approve(address(registry), 1250e18);
+        registry.fundResources(1250e18);
         uint256 supply = token.totalSupply();
         vm.prank(OPERATOR);
         executor.recordHeartbeat(address(registry), 0, 400, 1, 400, 2, 400);
@@ -192,9 +200,10 @@ contract RevisionFindingsTest is Test {
         registry.levelUp(1);
         vm.prank(CAROL);
         registry.levelUp(2);
-        assertEq(registry.resourcePot(), 0);
+        assertEq(registry.resourcePot(), 15e18);
+        assertEq(registry.rewardsPool(), 25e18);
         assertEq(registry.allocatedResourceBacking(), 0);
-        assertEq(token.balanceOf(address(registry)), 0);
+        assertEq(token.balanceOf(address(registry)), 40e18);
         assertEq(token.totalSupply(), supply - 1200e18);
         assertEq(registry.heartbeatCount(), 1);
         for (uint256 i; i < 3; ++i) {
@@ -229,7 +238,7 @@ contract RevisionFindingsTest is Test {
         uint256 resourcesBefore = registry.resourcePot();
         uint256 treasuryBefore = token.balanceOf(OPERATOR);
         token.approve(address(registry), gross);
-        vm.expectEmit(true, true, false, true, address(registry));
+        vm.expectEmit(true, true, false, true, address(token));
         emit TaxTaken(address(this), RECIPIENT, gross, fee, rewards, resources, burned, treasuryAmount);
         registry.transferWithTax(RECIPIENT, gross);
         assertEq(token.balanceOf(RECIPIENT) - netBefore, gross - fee);
@@ -238,6 +247,7 @@ contract RevisionFindingsTest is Test {
         assertEq(supply - token.totalSupply(), burned);
         assertEq(token.balanceOf(OPERATOR) - treasuryBefore, treasuryAmount);
         assertEq(senderBalance - token.balanceOf(address(this)), gross);
+        assertEq(rewards + resources + burned + treasuryAmount, fee);
         assertEq(token.allowance(address(this), address(registry)), 0);
         assertEq(token.balanceOf(address(registry)), registry.rewardsPool() + registry.resourcePot());
     }

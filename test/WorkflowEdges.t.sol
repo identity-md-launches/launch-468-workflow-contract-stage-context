@@ -21,10 +21,11 @@ contract WorkflowEdgesTest is Test {
         token = new LaunchToken();
         executor = new GrantExecutor(OPERATOR);
         registry = new CityRegistry(address(token), address(executor));
+        token.setCityRegistry(address(registry));
         token.approve(address(registry), type(uint256).max);
-        token.transfer(ALICE, 1_000_000 ether);
-        token.transfer(BOB, 1_000_000 ether);
-        token.transfer(CAROL, 1_000_000 ether);
+        deal(address(token), ALICE, 1_000_000 ether);
+        deal(address(token), BOB, 1_000_000 ether);
+        deal(address(token), CAROL, 1_000_000 ether);
     }
 
     function testFuzzStalePurchaseQuoteRevertsWithoutChangingRewardsOrOwnership(uint8 plot) public {
@@ -58,7 +59,7 @@ contract WorkflowEdgesTest is Test {
         assertEq(token.balanceOf(ALICE), balanceBefore);
         assertEq(token.totalSupply(), supplyBefore);
         assertEq(token.allowance(ALICE, address(registry)), quoted);
-        assertEq(registry.claimableRewards((uint256(plot) + 1) % 256), 17 ether);
+        assertEq(registry.claimableRewards((uint256(plot) + 1) % 256), 1666e16);
 
         _buy(registry, ALICE, plot);
         assertEq(registry.soldPlots(), 2);
@@ -78,7 +79,7 @@ contract WorkflowEdgesTest is Test {
         uint256 c = bound(thirdSeed, 1, 100_000);
         // The pot can cover earlier grants, but misses the failing one by ONE resource wei.
         uint256 remaining = (failSecond ? a + b : a + b + c) * 1 ether - 1;
-        registry.fundResources(6 ether + remaining);
+        _fundResourcesExact(6 ether + remaining);
         vm.warp(100);
         vm.prank(OPERATOR);
         executor.recordHeartbeat(address(registry), 0, 1, 127, 2, 255, 3);
@@ -93,7 +94,7 @@ contract WorkflowEdgesTest is Test {
 
     function testMaximumGrantAmountRevertsBeforeMultiplicationAndPreservesPot() public {
         _buy(registry, ALICE, 0);
-        registry.fundResources(1 ether);
+        _fundResourcesExact(1 ether);
         vm.expectRevert(CityRegistry.InsufficientResourcePot.selector);
         vm.prank(OPERATOR);
         executor.grantResources(address(registry), 0, type(uint256).max);
@@ -133,88 +134,94 @@ contract WorkflowEdgesTest is Test {
         uint256 remaining = token.balanceOf(address(this));
         uint256 beforeBalance = token.balanceOf(ALICE);
         registry.fundRewards(remaining);
-        assertEq(registry.claimableRewards(0), remaining);
+        uint256 grossClaim = remaining - remaining / 25 + _taxRewards(remaining);
+        assertEq(registry.claimableRewards(0), grossClaim);
         vm.prank(OPERATOR);
         executor.pause();
         vm.prank(ALICE);
-        assertEq(registry.claimRewards(0), remaining);
-        assertEq(token.balanceOf(ALICE), beforeBalance + remaining);
-        assertEq(registry.rewardsPool(), 0);
-        assertEq(token.balanceOf(address(registry)), 0);
+        assertEq(registry.claimRewards(0), grossClaim);
+        uint256 net = grossClaim - grossClaim / 25;
+        assertEq(token.balanceOf(ALICE), beforeBalance + net);
+        assertEq(registry.rewardsPool(), _taxRewards(grossClaim));
+        assertEq(token.balanceOf(address(registry)), registry.rewardsPool() + registry.resourcePot());
 
         vm.startPrank(ALICE);
-        token.approve(address(registry), remaining);
-        registry.fundRewards(remaining);
-        assertEq(registry.claimRewards(0), remaining);
-        vm.expectRevert(CityRegistry.NoRewards.selector);
-        registry.claimRewards(0);
+        token.approve(address(registry), net);
+        registry.fundRewards(net);
+        uint256 secondGross = _taxRewards(grossClaim) + net - net / 25 + _taxRewards(net);
+        assertEq(registry.claimRewards(0), secondGross);
         vm.stopPrank();
-        assertEq(token.balanceOf(ALICE), beforeBalance + remaining);
-        assertEq(registry.rewardsPool(), 0);
+        assertEq(token.balanceOf(ALICE), beforeBalance + secondGross - secondGross / 25);
+        assertEq(registry.rewardsPool(), _taxRewards(secondGross));
+        assertEq(token.balanceOf(address(registry)), registry.rewardsPool() + registry.resourcePot());
     }
 
-    /// @dev Metamorphic oracle: eager settlement and one final settlement must agree.
-    /// Both branches see the same funding, joins, and upgrades, but different claim order/frequency.
+    /// @dev Payouts themselves generate rewards. Track the independently calculated history
+    /// of deposits and payout taxes through repeated claims, joining cities and weight changes.
     /// forge-config: default.fuzz.runs = 256
-    function testFuzzClaimTimingCannotChangeLifetimeEntitlement(
+    function testFuzzRepeatedClaimsAndWeightChangesPreserveBacking(
         uint256 firstSeed,
         uint256 stepSeed,
         uint8 countSeed
     ) public {
-        CityRegistry deferred = new CityRegistry(address(token), address(executor));
-        token.approve(address(deferred), type(uint256).max);
         _buy(registry, ALICE, 0);
         _buy(registry, BOB, 127);
-        _buy(deferred, ALICE, 0);
-        _buy(deferred, BOB, 127);
-        registry.fundResources(400 ether);
-        deferred.fundResources(400 ether);
-        vm.startPrank(OPERATOR);
+        _fundResourcesExact(400 ether);
+        vm.prank(OPERATOR);
         executor.grantResources(address(registry), 0, 400);
-        executor.grantResources(address(deferred), 0, 400);
-        vm.stopPrank();
-
         uint256 first = bound(firstSeed, 1, 100 ether);
         uint256 step = bound(stepSeed, 0, 100);
         uint256 count = bound(countSeed, 2, 25);
-        uint256[3] memory paid;
+        uint256 expectedRewards = registry.rewardsPool();
+        uint256 expectedResources = registry.resourcePot();
         address[3] memory owners = [ALICE, BOB, CAROL];
         uint256[3] memory ids = [uint256(0), 127, 255];
         for (uint256 i; i < count; ++i) {
             uint256 amount = first + step * i;
             registry.fundRewards(amount);
-            deferred.fundRewards(amount);
+            expectedRewards += amount - amount / 25 + _taxRewards(amount);
+            expectedResources += (amount / 25) * 3 / 10;
             for (uint256 j; j < 3; ++j) {
                 uint256 index = (i + j) % 3;
-                if (registry.claimableRewards(ids[index]) == 0) continue;
+                uint256 quote = registry.claimableRewards(ids[index]);
+                if (quote == 0) continue;
+                uint256 beforeBalance = token.balanceOf(owners[index]);
                 vm.prank(owners[index]);
-                paid[index] += registry.claimRewards(ids[index]);
+                assertEq(registry.claimRewards(ids[index]), quote);
+                assertEq(token.balanceOf(owners[index]) - beforeBalance, quote - quote / 25);
+                expectedRewards = expectedRewards - quote + _taxRewards(quote);
+                expectedResources += (quote / 25) * 3 / 10;
             }
             if (i == count / 2) {
                 vm.prank(ALICE);
                 registry.levelUp(0);
-                vm.prank(ALICE);
-                deferred.levelUp(0);
                 _buy(registry, CAROL, 255);
-                _buy(deferred, CAROL, 255);
             }
-        }
-
-        for (uint256 j; j < 3; ++j) {
-            assertEq(paid[j] + registry.claimableRewards(ids[j]), deferred.claimableRewards(ids[j]));
-            if (deferred.claimableRewards(ids[j]) != 0) {
-                vm.prank(owners[j]);
-                assertEq(deferred.claimRewards(ids[j]), paid[j]);
-            }
-            // Compare all residual credit, including any credit not settled by a zero claim.
+            assertEq(registry.rewardsPool(), expectedRewards);
+            assertEq(registry.resourcePot(), expectedResources);
             assertEq(
-                _pendingScaled(registry, ids[j]),
-                _pendingScaled(deferred, ids[j]),
-                "claim timing cannot erase fractions"
+                token.balanceOf(address(registry)),
+                expectedRewards + expectedResources + registry.allocatedResourceBacking()
             );
+            uint256 claims = registry.claimableRewards(0) + registry.claimableRewards(127)
+                + registry.claimableRewards(255);
+            assertLe(claims, expectedRewards);
+            assertLe(expectedRewards - claims, 3, "only fractional city credits remain unclaimable");
         }
-        assertEq(registry.rewardsPool(), deferred.rewardsPool());
-        assertEq(registry.rewardRemainder(), deferred.rewardRemainder());
+    }
+
+    function _taxRewards(uint256 amount) private pure returns (uint256) {
+        uint256 tax = amount / 25;
+        return tax - tax * 3 / 10 - 2 * (tax / 10);
+    }
+
+    function _fundResourcesExact(uint256 amount) private {
+        uint256 gross = amount * 1000 / 972;
+        gross = gross > 16 ? gross - 16 : 1;
+        while (gross - gross / 25 + (gross / 25) * 3 / 10 != amount) ++gross;
+        uint256 beforePot = registry.resourcePot();
+        registry.fundResources(gross);
+        assertEq(registry.resourcePot() - beforePot, amount);
     }
 
     function _buy(CityRegistry target, address buyer, uint256 id) private {

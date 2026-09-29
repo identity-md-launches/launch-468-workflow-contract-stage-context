@@ -8,8 +8,7 @@ import {IGridToken} from "./interfaces/IGridToken.sol";
 import {GrantExecutor} from "./GrantExecutor.sol";
 
 /// @notice Soulbound cities, weighted rewards, and nonredeemable resources backed by GRID.
-/// @dev LaunchToken transfers are fee-free. Only this contract's explicit transferWithTax
-/// route levies a fee; this cannot enforce the workflow's universal transfer tax.
+/// @dev The bound GRID token credits its transfer-tax shares through onTaxReceived.
 contract CityRegistry is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -66,22 +65,14 @@ contract CityRegistry is ReentrancyGuard {
     error InvalidRecipient();
     error UnexpectedTokenAmount();
     error SoldOut();
+    error UnauthorizedToken();
 
     event CityBought(uint256 indexed cityId, address indexed owner, uint256 price);
     event ResourcesGranted(uint256 indexed cityId, uint256 amount);
     event CityLeveled(uint256 indexed cityId, uint256 level, uint256 resourcesConsumed);
     event RewardsClaimed(uint256 indexed cityId, address indexed owner, uint256 amount);
     event PoolsFunded(address indexed funder, uint256 rewards, uint256 resources);
-    event TaxTaken(
-        address indexed from,
-        address indexed to,
-        uint256 grossAmount,
-        uint256 fee,
-        uint256 rewards,
-        uint256 resources,
-        uint256 burned,
-        uint256 treasuryAmount
-    );
+    event TransferTaxReceived(uint256 rewards, uint256 resources);
     event HeartbeatRecorded(uint256 indexed sequence, uint256[3] cityIds, uint256[3] amounts);
 
     constructor(address token_, address grantExecutor_) {
@@ -180,42 +171,35 @@ contract CityRegistry is ReentrancyGuard {
         emit RewardsClaimed(cityId, msg.sender, amount);
     }
 
-    /// @notice Explicit funding is necessary because the admitted launch token has no transfer fee.
+    /// @notice Credit the net funding receipt, in addition to the token's automatic tax shares.
     function fundRewards(uint256 amount) external nonReentrant {
-        _pull(amount);
-        rewardsPool += amount;
-        _distribute(amount);
-        emit PoolsFunded(msg.sender, amount, 0);
+        uint256 received = _pull(amount);
+        rewardsPool += received;
+        _distribute(received);
+        emit PoolsFunded(msg.sender, received, 0);
     }
 
     function fundResources(uint256 amount) external nonReentrant {
-        _pull(amount);
-        resourcePot += amount;
-        emit PoolsFunded(msg.sender, 0, amount);
+        uint256 received = _pull(amount);
+        resourcePot += received;
+        emit PoolsFunded(msg.sender, 0, received);
     }
 
-    /// @notice Opt-in transfer route: 4% levy rounded up, split 50/30/10/10 with split dust to rewards.
-    /// @dev Every positive amount pays a fee. Ordinary ERC-20 transfers bypass this route.
+    /// @notice Compatibility route that forwards one universally taxed token transfer.
     function transferWithTax(address to, uint256 amount) external nonReentrant {
         if (to == address(0) || to == address(this)) revert InvalidRecipient();
-        _pull(amount);
-        // _pull rejects zero. This ceiling avoids overflowing amount + 24.
-        uint256 fee = (amount - 1) / 25 + 1;
-        // Split the already-rounded fee, rather than independently rounding gross percentages.
-        // forge-lint: disable-next-line(divide-before-multiply)
-        uint256 resources = fee * 3 / 10;
-        uint256 burned = fee / 10;
-        uint256 treasuryAmount = fee / 10;
-        uint256 rewards = fee - resources - burned - treasuryAmount;
+        if (amount == 0) revert InvalidAmount();
+        token.safeTransferFrom(msg.sender, to, amount);
+    }
+
+    /// @notice Account for pool shares already delivered by GRID, including taxes on claims.
+    /// @dev Intentionally callable during a guarded funding/claim: token-only, no external calls.
+    function onTaxReceived(uint256 rewards, uint256 resources) external {
+        if (msg.sender != address(token)) revert UnauthorizedToken();
         rewardsPool += rewards;
         resourcePot += resources;
         _distribute(rewards);
-        emit TaxTaken(msg.sender, to, amount, fee, rewards, resources, burned, treasuryAmount);
-        token.safeTransfer(to, amount - fee);
-        // Burn cannot reenter a state-changing registry operation protected by the guard.
-        // forge-lint: disable-next-line(reentrancy-no-eth)
-        if (burned != 0) IGridToken(address(token)).burn(burned);
-        if (treasuryAmount != 0) token.safeTransfer(treasury, treasuryAmount);
+        emit TransferTaxReceived(rewards, resources);
     }
 
     /// @notice Amount is in whole resources; each resource allocates one GRID from the resource pot.
@@ -256,13 +240,18 @@ contract CityRegistry is ReentrancyGuard {
         emit ResourcesGranted(cityId, amount);
     }
 
-    function _pull(uint256 amount) private {
+    function _pull(uint256 amount) private returns (uint256 received) {
         if (amount == 0) revert InvalidAmount();
         uint256 beforeBalance = token.balanceOf(address(this));
+        uint256 beforePools = rewardsPool + resourcePot;
+        received = amount - IGridToken(address(token)).transferTax(amount);
         token.safeTransferFrom(msg.sender, address(this), amount);
-        // Exact delta is required: accepting less would create liabilities without their backing.
+        // Callback tax credits are already booked; only the net funding creates another liability.
+        uint256 taxCredit = rewardsPool + resourcePot - beforePools;
         // forge-lint: disable-next-line(incorrect-strict-equality)
-        if (token.balanceOf(address(this)) != beforeBalance + amount) revert UnexpectedTokenAmount();
+        if (token.balanceOf(address(this)) != beforeBalance + received + taxCredit) {
+            revert UnexpectedTokenAmount();
+        }
     }
 
     function _distribute(uint256 amount) private {

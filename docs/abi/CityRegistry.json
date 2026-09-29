@@ -420,6 +420,24 @@
   },
   {
     "type": "function",
+    "name": "onTaxReceived",
+    "inputs": [
+      {
+        "name": "rewards",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "resources",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "queuedRewards",
     "inputs": [],
     "outputs": [
@@ -724,32 +742,8 @@
   },
   {
     "type": "event",
-    "name": "TaxTaken",
+    "name": "TransferTaxReceived",
     "inputs": [
-      {
-        "name": "from",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "to",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      },
-      {
-        "name": "grossAmount",
-        "type": "uint256",
-        "indexed": false,
-        "internalType": "uint256"
-      },
-      {
-        "name": "fee",
-        "type": "uint256",
-        "indexed": false,
-        "internalType": "uint256"
-      },
       {
         "name": "rewards",
         "type": "uint256",
@@ -758,18 +752,6 @@
       },
       {
         "name": "resources",
-        "type": "uint256",
-        "indexed": false,
-        "internalType": "uint256"
-      },
-      {
-        "name": "burned",
-        "type": "uint256",
-        "indexed": false,
-        "internalType": "uint256"
-      },
-      {
-        "name": "treasuryAmount",
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
@@ -876,6 +858,11 @@
   {
     "type": "error",
     "name": "UnauthorizedExecutor",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "UnauthorizedToken",
     "inputs": []
   },
   {

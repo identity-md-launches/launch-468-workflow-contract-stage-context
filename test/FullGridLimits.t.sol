@@ -25,29 +25,28 @@ contract FullGridLimitsTest is Test {
         token = new LaunchToken();
         executor = new GrantExecutor(OPERATOR);
         registry = new CityRegistry(address(token), address(executor));
+        token.setCityRegistry(address(registry));
         token.approve(address(registry), type(uint256).max);
         token.transfer(ALICE, 1_000_000 ether);
         vm.prank(ALICE);
         token.approve(address(registry), type(uint256).max);
     }
 
-    /// @dev Sold out, all at level 20: the closed grid rejects every entry, 1 wei of funding
-    /// rounds to nothing for everyone, an exact multiple of the weight splits exactly, and the
-    /// whole remaining supply is split within one wei per city and remains fully claimable.
+    /// @dev All 256 cities reach level 20. New rewards remain proportional to equal weights,
+    /// while every claim pays a transfer tax and recycles its rewards share to all owners.
     function testFullGridAtMaximumLevelSplitsRewardsExactlyAndStaysClosed() public {
-        uint256 purchaseBurn = _fillGridToMaximumLevel();
+        uint256 supplyBefore = token.totalSupply();
+        (uint256 purchaseBurn, uint256 transferBurn) = _fillGridToMaximumLevel();
         assertEq(registry.soldPlots(), CITY_COUNT);
         assertEq(registry.totalWeight(), MAX_WEIGHT);
-        assertEq(registry.resourcePot(), 0);
         assertEq(registry.allocatedResourceBacking(), 0);
-        assertEq(token.balanceOf(address(registry)), 0);
+        _assertCustody();
         assertEq(
             token.totalSupply(),
-            1_000_000_000 ether - purchaseBurn - CITY_COUNT * RESOURCES_TO_MAX * 1 ether,
-            "purchases and consumed resources are the only burns"
+            supplyBefore - purchaseBurn - transferBurn - CITY_COUNT * RESOURCES_TO_MAX * 1 ether,
+            "purchases, transfer taxes and consumed resources account for burns"
         );
 
-        // Closed grid: no quote, no purchase, no upgrade, whoever asks.
         vm.expectRevert(CityRegistry.SoldOut.selector);
         registry.cityPrice();
         token.transfer(OUTSIDER, 100_000 ether);
@@ -63,56 +62,62 @@ contract FullGridLimitsTest is Test {
             vm.prank(_buyer(id));
             registry.levelUp(id);
         }
-        assertEq(registry.soldPlots(), CITY_COUNT);
-        assertEq(registry.totalWeight(), MAX_WEIGHT);
 
-        // One wei over the maximum weight: nobody can claim, nothing is lost to the remainder.
-        registry.fundRewards(1);
-        assertEq(registry.accRewardPerWeight(), 1e27 / MAX_WEIGHT);
-        assertEq(registry.rewardRemainder(), 0);
-        for (uint256 id; id < CITY_COUNT; id += 51) {
-            assertEq(registry.claimableRewards(id), 0);
-            vm.expectRevert(CityRegistry.NoRewards.selector);
-            vm.prank(_buyer(id));
-            registry.claimRewards(id);
-        }
-        assertEq(registry.rewardsPool(), 1);
-
-        // Exactly the weight in wei: every city is owed exactly its level squared.
-        registry.fundRewards(MAX_WEIGHT - 1);
+        uint256[256] memory previous;
         for (uint256 id; id < CITY_COUNT; ++id) {
-            assertEq(registry.claimableRewards(id), 400, "level squared wei each");
+            previous[id] = registry.claimableRewards(id);
+        }
+        uint256 poolBefore = registry.rewardsPool();
+        registry.fundRewards(1);
+        assertEq(registry.rewardsPool(), poolBefore + 1, "sub-tax-unit funding remains accounted for");
+        for (uint256 id; id < CITY_COUNT; ++id) {
+            assertLe(registry.claimableRewards(id) - previous[id], 1);
         }
 
-        // The whole remaining supply: an equal split, within one wei per equal-weight city.
+        // 25,600,000 gross wei contributes 25,088,000 reward wei, exactly 98,000 per city.
+        for (uint256 id; id < CITY_COUNT; ++id) {
+            previous[id] = registry.claimableRewards(id);
+        }
+        registry.fundRewards(MAX_WEIGHT * 250);
+        for (uint256 id; id < CITY_COUNT; ++id) {
+            assertEq(registry.claimableRewards(id) - previous[id], 98_000);
+            previous[id] = registry.claimableRewards(id);
+        }
+
         uint256 remaining = token.balanceOf(address(this));
+        poolBefore = registry.rewardsPool();
         registry.fundRewards(remaining);
-        uint256 funded = MAX_WEIGHT + remaining;
-        uint256 claimedTotal;
+        uint256 distributed = registry.rewardsPool() - poolBefore;
+        for (uint256 id; id < CITY_COUNT; ++id) {
+            assertApproxEqAbs(registry.claimableRewards(id) - previous[id], distributed / CITY_COUNT, 1);
+        }
+        uint256 pool = registry.rewardsPool();
+        uint256 resources = registry.resourcePot();
         for (uint256 id; id < CITY_COUNT; ++id) {
             uint256 quote = registry.claimableRewards(id);
-            assertApproxEqAbs(quote, funded / CITY_COUNT, 1, "equal weights share equally");
+            uint256 tax = quote * 400 / 10_000;
+            uint256 resourceShare = tax * 30 / 100;
+            uint256 rewardsShare = tax - resourceShare - 2 * (tax / 10);
             address owner = _buyer(id);
-            uint256 before = token.balanceOf(owner);
+            uint256 beforeBalance = token.balanceOf(owner);
             vm.prank(owner);
-            assertEq(registry.claimRewards(id), quote);
-            assertEq(token.balanceOf(owner) - before, quote);
-            claimedTotal += quote;
+            assertEq(registry.claimRewards(id), quote, "claim still returns gross accrued rewards");
+            assertEq(token.balanceOf(owner) - beforeBalance, quote - tax, "wallet receives net rewards");
+            pool = pool - quote + rewardsShare;
+            resources += resourceShare;
+            assertEq(registry.rewardsPool(), pool);
+            assertEq(registry.resourcePot(), resources);
         }
-        assertLe(funded - claimedTotal, CITY_COUNT, "at most one wei per city stays as fractions");
-        assertEq(registry.rewardsPool(), funded - claimedTotal);
-        assertEq(token.balanceOf(address(registry)), registry.rewardsPool());
+        assertGt(registry.claimableRewards(255), 0, "each claim earns a share of its own tax");
+        _assertCustody();
         assertEq(token.balanceOf(address(this)), 0);
-        vm.expectRevert(CityRegistry.NoRewards.selector);
-        vm.prank(_buyer(255));
-        registry.claimRewards(255);
     }
 
     /// @dev Grants to a level-20 city are accepted and keep their backing in custody: nothing
     /// can consume them and nothing refunds them, exactly as the README documents.
     function testGrantsToMaximumLevelCityStayBackedButUnusable() public {
         _buy(ALICE, 0);
-        registry.fundResources(RESOURCES_TO_MAX * 1 ether + 4 ether);
+        registry.fundResources(300_000 ether);
         vm.prank(OPERATOR);
         executor.grantResources(address(registry), 0, RESOURCES_TO_MAX);
         for (uint256 i; i < 19; ++i) {
@@ -126,6 +131,8 @@ contract FullGridLimitsTest is Test {
         _buy(_buyer(1), 1);
         _buy(_buyer(2), 2);
         uint256 supply = token.totalSupply();
+        uint256 pot = registry.resourcePot();
+        uint256 rewards = registry.claimableRewards(0);
         vm.startPrank(OPERATOR);
         executor.grantResources(address(registry), 0, 1);
         executor.recordHeartbeat(address(registry), 0, 1, 1, 1, 2, 1);
@@ -133,14 +140,14 @@ contract FullGridLimitsTest is Test {
         (, level, resources,,) = registry.cities(0);
         assertEq(level, 20);
         assertEq(resources, 2);
-        assertEq(registry.resourcePot(), 0);
+        assertEq(registry.resourcePot(), pot - 4 ether);
         assertEq(registry.allocatedResourceBacking(), 4 ether);
-        assertEq(token.balanceOf(address(registry)), 4 ether);
+        _assertCustody();
         assertEq(token.totalSupply(), supply, "unusable grants burn nothing");
         vm.expectRevert(CityRegistry.MaximumLevel.selector);
         vm.prank(ALICE);
         registry.levelUp(0);
-        assertEq(registry.claimableRewards(0), 0, "resources are not rewards");
+        assertEq(registry.claimableRewards(0), rewards, "grants themselves are not rewards");
         assertEq(registry.lastHeartbeatCityIds(0), 0);
         assertEq(registry.lastHeartbeatAmounts(0), 1);
     }
@@ -158,14 +165,14 @@ contract FullGridLimitsTest is Test {
         assertEq(nextY, x == 15 ? y + 1 : y, "a wrap moves one row down");
     }
 
-    /// @dev Equal levels receive equal shares at every level and funding size, and the quote
-    /// is what the claim pays.
+    /// @dev Once all levels match, each new funding adds an equal share, regardless of
+    /// unequal historic rewards accrued while building the cities. Claims return gross amounts.
     function testFuzzEqualLevelsShareEquallyAtEveryLevel(uint256 amountSeed, uint8 levelSeed) public {
         uint256 level = bound(levelSeed, 1, 20);
         uint256 amount = bound(amountSeed, 1, 100_000_000 ether);
         uint256[3] memory ids = [uint256(0), 17, 255];
         uint256 resourcesEach = _resourcesToLevel(level);
-        registry.fundResources(3 * resourcesEach * 1 ether + 1);
+        registry.fundResources(3 * resourcesEach * 1 ether * 1000 / 972 + 1);
         for (uint256 j; j < 3; ++j) {
             _buy(_buyer(ids[j]), ids[j]);
             if (resourcesEach != 0) {
@@ -179,19 +186,31 @@ contract FullGridLimitsTest is Test {
         }
         assertEq(registry.totalWeight(), 3 * level * level);
         assertEq(registry.allocatedResourceBacking(), 0);
+        uint256[3] memory beforeQuotes;
+        for (uint256 j; j < 3; ++j) {
+            beforeQuotes[j] = registry.claimableRewards(ids[j]);
+        }
+        uint256 poolBefore = registry.rewardsPool();
         registry.fundRewards(amount);
-        uint256 paid;
+        uint256 rewardIncrease = registry.rewardsPool() - poolBefore;
+        for (uint256 j; j < 3; ++j) {
+            assertApproxEqAbs(
+                registry.claimableRewards(ids[j]) - beforeQuotes[j],
+                rewardIncrease / 3,
+                1,
+                "equal levels receive equal shares of each new reward"
+            );
+        }
         for (uint256 j; j < 3; ++j) {
             uint256 quote = registry.claimableRewards(ids[j]);
-            assertApproxEqAbs(quote, amount / 3, 1, "equal levels, equal share");
             if (quote == 0) continue;
-            vm.prank(_buyer(ids[j]));
+            address buyer = _buyer(ids[j]);
+            uint256 balanceBefore = token.balanceOf(buyer);
+            vm.prank(buyer);
             assertEq(registry.claimRewards(ids[j]), quote);
-            paid += quote;
+            assertEq(token.balanceOf(buyer) - balanceBefore, quote - quote * 400 / 10_000);
+            _assertCustody();
         }
-        assertLe(amount - paid, 3);
-        assertEq(registry.rewardsPool(), amount - paid);
-        assertEq(registry.resourcePot(), 1, "resource dust below one GRID stays in the pot");
     }
 
     /// @dev Sending to yourself is not a way around the levy; the sender simply loses the fee.
@@ -199,26 +218,33 @@ contract FullGridLimitsTest is Test {
         _buy(ALICE, 0);
         uint256 balance = token.balanceOf(ALICE);
         uint256 supply = token.totalSupply();
+        uint256 rewards = registry.rewardsPool();
+        uint256 resources = registry.resourcePot();
+        uint256 treasury = token.balanceOf(OPERATOR);
+        uint256 quote = registry.claimableRewards(0);
         vm.startPrank(ALICE);
         token.approve(address(registry), 250 ether);
         registry.transferWithTax(ALICE, 250 ether);
         vm.stopPrank();
         assertEq(token.allowance(ALICE, address(registry)), 0);
         assertEq(balance - token.balanceOf(ALICE), 10 ether, "net loss is exactly the fee");
-        assertEq(registry.rewardsPool(), 5 ether);
-        assertEq(registry.resourcePot(), 3 ether);
+        assertEq(registry.rewardsPool() - rewards, 5 ether);
+        assertEq(registry.resourcePot() - resources, 3 ether);
         assertEq(supply - token.totalSupply(), 1 ether);
-        assertEq(token.balanceOf(OPERATOR), 1 ether);
-        assertEq(registry.claimableRewards(0), 5 ether, "the payer's own city earns the rewards share");
+        assertEq(token.balanceOf(OPERATOR) - treasury, 1 ether);
+        assertEq(registry.claimableRewards(0) - quote, 5 ether);
     }
 
     /// @dev The treasury as recipient receives the net amount plus its own share, nothing more.
     function testTreasuryRecipientReceivesNetPlusItsShare() public {
+        uint256 treasury = token.balanceOf(OPERATOR);
+        uint256 alice = token.balanceOf(ALICE);
+        uint256 custody = token.balanceOf(address(registry));
         vm.prank(ALICE);
         registry.transferWithTax(OPERATOR, 250 ether);
-        assertEq(token.balanceOf(OPERATOR), 241 ether);
-        assertEq(token.balanceOf(ALICE), 1_000_000 ether - 250 ether);
-        assertEq(token.balanceOf(address(registry)), 8 ether);
+        assertEq(token.balanceOf(OPERATOR) - treasury, 241 ether);
+        assertEq(alice - token.balanceOf(ALICE), 250 ether);
+        assertEq(token.balanceOf(address(registry)) - custody, 8 ether);
     }
 
     /// @dev Pause lives on the executor: one pause stops grants to every registry it serves,
@@ -247,10 +273,14 @@ contract FullGridLimitsTest is Test {
         second.fundRewards(3 ether);
         _buy(_buyer(1), 1);
         _buyFrom(second, _buyer(1), 1);
+        uint256 firstQuote = registry.claimableRewards(0);
+        uint256 otherQuote = second.claimableRewards(9);
         vm.startPrank(ALICE);
-        assertEq(registry.claimRewards(0), 2 ether);
-        assertEq(second.claimRewards(9), 3 ether);
+        assertEq(registry.claimRewards(0), firstQuote);
+        assertEq(second.claimRewards(9), otherQuote);
         vm.stopPrank();
+        uint256 firstPot = registry.resourcePot();
+        uint256 otherPot = second.resourcePot();
 
         vm.startPrank(OPERATOR);
         executor.unpause();
@@ -261,8 +291,8 @@ contract FullGridLimitsTest is Test {
         (,, uint256 other,,) = second.cities(9);
         assertEq(first, 1);
         assertEq(other, 2);
-        assertEq(registry.resourcePot(), 9 ether);
-        assertEq(second.resourcePot(), 8 ether);
+        assertEq(registry.resourcePot(), firstPot - 1 ether);
+        assertEq(second.resourcePot(), otherPot - 2 ether);
     }
 
     /// @dev A contract that is not a registry rejects the forwarded call; the executor keeps no
@@ -270,6 +300,7 @@ contract FullGridLimitsTest is Test {
     function testForwardingToANonRegistryContractRevertsWithoutSideEffects() public {
         _buy(ALICE, 0);
         registry.fundResources(10 ether);
+        uint256 pot = registry.resourcePot();
         vm.startPrank(OPERATOR);
         vm.expectRevert();
         executor.grantResources(address(token), 0, 1);
@@ -277,20 +308,24 @@ contract FullGridLimitsTest is Test {
         executor.recordHeartbeat(address(executor), 0, 1, 1, 1, 2, 1);
         vm.stopPrank();
         assertFalse(executor.paused());
-        assertEq(registry.resourcePot(), 10 ether);
+        assertEq(registry.resourcePot(), pot);
         assertEq(registry.allocatedResourceBacking(), 0);
         assertEq(registry.heartbeatCount(), 0);
         (,, uint256 resources,,) = registry.cities(0);
         assertEq(resources, 0);
     }
 
-    function _fillGridToMaximumLevel() private returns (uint256 purchaseBurn) {
-        registry.fundResources(CITY_COUNT * RESOURCES_TO_MAX * 1 ether);
+    function _fillGridToMaximumLevel() private returns (uint256 purchaseBurn, uint256 transferBurn) {
+        uint256 funding = CITY_COUNT * RESOURCES_TO_MAX * 1 ether * 1000 / 972 + 1;
+        registry.fundResources(funding);
+        transferBurn = funding / 250;
         for (uint256 id; id < CITY_COUNT; ++id) {
             address buyer = _buyer(id);
             uint256 price = registry.cityPrice();
             purchaseBurn += price;
-            token.transfer(buyer, price);
+            uint256 gross = (price * 25 + 23) / 24;
+            token.transfer(buyer, gross);
+            transferBurn += gross / 250;
             vm.startPrank(buyer);
             token.approve(address(registry), price);
             registry.buyCity(id);
@@ -305,8 +340,15 @@ contract FullGridLimitsTest is Test {
             assertEq(owner, buyer);
             assertEq(level, 20);
             assertEq(resources, 0);
-            assertEq(token.balanceOf(buyer), 0);
+            assertLe(token.balanceOf(buyer), 1, "purchase funding includes the transfer tax");
         }
+    }
+
+    function _assertCustody() private view {
+        assertEq(
+            token.balanceOf(address(registry)),
+            registry.rewardsPool() + registry.resourcePot() + registry.allocatedResourceBacking()
+        );
     }
 
     function _resourcesToLevel(uint256 level) private pure returns (uint256 total) {
@@ -325,7 +367,7 @@ contract FullGridLimitsTest is Test {
 
     function _buyFrom(CityRegistry target, address buyer, uint256 id) private {
         uint256 price = target.cityPrice();
-        if (token.balanceOf(buyer) < price) token.transfer(buyer, price);
+        if (token.balanceOf(buyer) < price) token.transfer(buyer, (price * 25 + 23) / 24);
         vm.startPrank(buyer);
         token.approve(address(target), price);
         target.buyCity(id);

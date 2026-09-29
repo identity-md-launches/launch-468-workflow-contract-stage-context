@@ -11,6 +11,7 @@ import {CityRegistry} from "../src/CityRegistry.sol";
 /// are unavailable. With fail-on-revert enabled, unexpected reverts fail the invariant run.
 contract CityAccountingHandler is Test {
     uint256 public constant ACTOR_COUNT = 8;
+    address public constant OPERATOR = 0x5b95A971B4583A5f011E9DA082acdD679b870D06;
     uint256 public constant INITIAL_SUPPLY = 1_000_000_000 ether;
     LaunchToken public immutable token;
     GrantExecutor public immutable executor;
@@ -22,12 +23,14 @@ contract CityAccountingHandler is Test {
 
     constructor() {
         token = new LaunchToken();
-        executor = new GrantExecutor(address(this));
+        executor = new GrantExecutor(OPERATOR);
         registry = new CityRegistry(address(token), address(executor));
+        token.setCityRegistry(address(registry));
         for (uint256 i; i < ACTOR_COUNT; ++i) {
             address actor = address(uint160(0xAC7000 + i));
             actors[i] = actor;
             token.transfer(actor, 20_000_000 ether);
+            totalBurned += 80_000 ether;
         }
     }
 
@@ -54,6 +57,7 @@ contract CityAccountingHandler is Test {
         token.approve(address(registry), amount);
         registry.fundRewards(amount);
         vm.stopPrank();
+        totalBurned += amount / 250;
     }
 
     function fundResources(uint256 actorSeed, uint256 amountSeed) external {
@@ -64,6 +68,7 @@ contract CityAccountingHandler is Test {
         token.approve(address(registry), amount);
         registry.fundResources(amount);
         vm.stopPrank();
+        totalBurned += amount / 250;
     }
 
     function taxedTransfer(uint256 fromSeed, uint256 toSeed, uint256 amountSeed) external {
@@ -75,7 +80,7 @@ contract CityAccountingHandler is Test {
         token.approve(address(registry), amount);
         registry.transferWithTax(to, amount);
         vm.stopPrank();
-        totalBurned += ((amount + 24) / 25) / 10;
+        totalBurned += amount / 250;
     }
 
     function grant(uint256 actorSeed, uint256 amountSeed) external {
@@ -83,6 +88,7 @@ contract CityAccountingHandler is Test {
         uint256 available = registry.resourcePot() / 1 ether;
         if (cityIdPlusOne == 0 || available == 0) return;
         uint256 amount = 1 + amountSeed % _min(available, 50_000);
+        vm.prank(OPERATOR);
         executor.grantResources(address(registry), cityIdPlusOne - 1, amount);
         totalGrantedResources += amount;
     }
@@ -95,6 +101,7 @@ contract CityAccountingHandler is Test {
         uint256 perCityAvailable = registry.resourcePot() / 1 ether / 3;
         if (id1 == 0 || id2 == 0 || id3 == 0 || perCityAvailable == 0) return;
         uint256 amount = 1 + amountSeed % _min(perCityAvailable, 10_000);
+        vm.prank(OPERATOR);
         executor.recordHeartbeat(address(registry), id1 - 1, amount, id2 - 1, amount, id3 - 1, amount);
         totalGrantedResources += 3 * amount;
     }
@@ -119,7 +126,8 @@ contract CityAccountingHandler is Test {
         uint256 cityIdPlusOne = registry.cityOf(actor);
         if (cityIdPlusOne == 0 || registry.claimableRewards(cityIdPlusOne - 1) == 0) return;
         vm.prank(actor);
-        registry.claimRewards(cityIdPlusOne - 1);
+        uint256 amount = registry.claimRewards(cityIdPlusOne - 1);
+        totalBurned += amount / 250;
     }
 
     function _fundingAmount(address actor, uint256 seed) private view returns (uint256) {
@@ -170,7 +178,8 @@ contract AccountingInvariantTest is Test {
 
     function testActionSequenceExercisesEveryAccountingTransition() public {
         _assertAccounting();
-        assertEq(registry.queuedRewards(), 101);
+        assertEq(registry.queuedRewards(), registry.rewardsPool());
+        assertGt(registry.queuedRewards(), 101, "initial transfers and funding also pay tax");
         for (uint256 i; i < 4; ++i) {
             handler.buy(i, 255 - i);
             _assertAccounting();
@@ -244,7 +253,7 @@ contract AccountingInvariantTest is Test {
         assertEq(
             token.totalSupply() + handler.totalBurned(),
             handler.INITIAL_SUPPLY(),
-            "purchases, the explicit levy and resource consumption account for every burn"
+            "purchases, transfer taxes and resource consumption account for every burn"
         );
     }
 }

@@ -1,50 +1,53 @@
-# Additional adversarial tests
+# Transfer tax and adversarial tests
 
-`WorkflowEdges.t.sol` checks stale price approvals, partial heartbeat rollback with a
-one-wei resource shortfall, maximum grant inputs, out-of-range IDs, large reward
-funding, and claim-frequency independence. Three boundary properties run 1,000 cases
-each; the claim-timing comparison runs 256 cases.
+The production `LaunchToken` is used by token, city, full-grid, and accounting/model
+suites. The hostile dependency in `Adversarial.t.sol` remains an explicit test double
+for rejected receipts/payouts and reentrancy; it is not evidence of GRID tax behavior.
+Some city unit-test fixtures seed precise balances with `deal` to isolate acquisition
+and reward arithmetic. The stateful model and full-grid tests exercise real taxed
+funding and payouts throughout.
 
-`RewardModelInvariant.t.sol` runs 256 sequences of 128 calls across six actors.
-Its eager per-city reward model uses the funding history and ghost levels, independently
-of the implementation's lazy reward accumulator. Lifetime payouts plus outstanding
-claims must match level-squared allocations within one minor unit, regardless of
-claim frequency. At this sequence length, accumulated rounding error is far below one
-minor unit; the tolerance permits crossing an integer boundary, not proportional loss.
-Separate exact checks cover ownership, resource accounting, pool custody, supply,
-authorization, pause state, and heartbeat history. Expected failures are exercised
-inside the handler; any unexpected revert fails the campaign. A deterministic sequence
-reaches level 20, and each randomized sequence ends by attempting every owner's claim.
+`LaunchToken.t.sol` pins the 400-bps direct and allowance-based transfer behavior,
+all four allocations and their sum, event fields, rounding, alias addresses, finite
+and infinite allowances, explicit burns, zero/maximum inputs and failure rollback.
+The fixed-value regressions must fail against a fee-free transfer implementation.
+`TransferTax.t.sol` covers one-time registry binding, escrow release, callback
+permissions and atomicity, funding, taxed claims and recipient/beneficiary overlap.
 
-The resource model now tracks consumption separately from cumulative grants, reflecting
-the accepted contract revision that burns backing on level-up. Unspent resources must
-equal allocated backing, and resource deposits must remain in custody or have been
-burned on consumption. The regression sequence checks these identities after upgrades,
-exhausts the grant pot, and verifies that burning allocated backing does not make it
-available for a second grant or heartbeat. Reaching level 20 consumes exactly 286,900
-resources. The reward oracle and its one-minor-unit rounding tolerance are unchanged.
+`RevisionFindings.t.sol` replaces the earlier fee-free evidence with required universal
+tax behavior and preserves purchase-approval, resource-backing and level-up regressions.
+`CityRegistry.t.sol` retains soulbound city, price, holding, grant, resource, reward,
+heartbeat and pause tests while asserting gross debits and net payouts.
+`WorkflowEdges.t.sol` checks stale quote approvals, partial heartbeat rollback,
+maximum/out-of-range inputs, large funding and conservation across repeated taxed
+claims. Claim timing can affect subsequent revenue because payouts now generate tax;
+it is no longer correct to assume claim-frequency independence.
 
-`FullGridLimits.t.sol` drives the registry to its largest reachable state: all 256 plots
-sold and every city at level 20, the maximum reward weight of 102,400. There it checks that
-the grid is closed to every purchase, quote and upgrade, that one wei of funding rounds to
-nothing for every city with no remainder, that funding exactly the weight in wei pays each
-city exactly its level squared, and that the entire remaining supply splits equally within
-one wei per city and is claimed in full. It pins grants to a level-20 city as accepted but
-unusable with their backing kept in custody, self-transfers and the treasury as recipients
-on the explicit levy route, the executor-wide scope of pause across two registries, and
-forwarding to a contract that is not a registry. Two fuzz properties cover the coordinate
-round-trip across the grid walk and equal shares for equal levels at every level and
-funding size.
+`AccountingInvariant.t.sol` checks 64 sequences of 64 calls. It reconciles custody
+with all reward/resource liabilities, scaled credits, city weights, resource grants
+and consumption, and every burn, including funding and payout taxes.
+`RewardModelInvariant.t.sol` checks 256 sequences of 128 calls across six actors.
+Its independent eager per-city oracle records both explicit funding and transfer-tax
+revenue, without using the contract's lazy reward accumulator to calculate entitlement.
+It checks payouts plus outstanding claims against each history within one minor unit,
+as well as supply, resources, permissions, heartbeat history and pause state. Unexpected
+reverts fail both invariant campaigns. A deterministic sequence reaches level 20.
 
-Run without writing build artifacts outside the permitted scratch directory:
+`FullGridLimits.t.sol` fills all 256 plots and levels every city to 20, attaining maximum
+weight 102,400. It verifies limits, new equal-weight allocations, taxed claims and the
+resulting recycled rewards, whole-resource backing, self/treasury recipients, pause
+scope across multiple registries, and invalid forwarding targets. Fuzz cases cover
+coordinates and equal-level funding. Pool-zero assumptions were replaced with exact
+accounting for remaining/recycled reserves.
 
 ```sh
-forge build --out test/scratch/out --cache-path test/scratch/cache
-forge test --out test/scratch/out --cache-path test/scratch/cache
+forge build
+forge test
+forge fmt --check
+python3 scripts/export_abi.py --check
 ```
 
-The universal-transfer-tax requirement remains unmet and conflicts with the protected
-exact-transfer check. The separately submitted `.imd-findings.json` contains the
-reproduced failing proof. These tests extend the accepted suite and do not resolve that
-source requirement. They need only the already-vendored dependencies and no RPC or
-environment configuration.
+All checks use the unchanged configuration and its pinned Solidity 0.8.26 compiler.
+Tests require no RPC, network, environment variables, filesystem permissions or FFI.
+Independent review repros may live in `test/scratch/`; that directory is discarded by
+the verifier and is not needed by the delivered suite.

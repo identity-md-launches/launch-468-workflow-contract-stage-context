@@ -2,25 +2,23 @@
 
 This source-stage deliverable contains the GRID launch token, soulbound city registry,
 grant executor, tests, and compiler-generated ABIs. It contains no deployment transactions,
-wallet keys, frontend, or `launch.json`. The separate manifest and review assignments and
-publication/deployment services own those later stages.
+wallet keys, or frontend. The existing `launch.json` records deployment intent; this
+revision changes source only. It does not deploy, replace, upgrade, or re-mint any live token.
 
-## Release conflict: universal transfer tax
+## Universal GRID transfer tax
 
-The approved workflow requires **every GRID transfer to charge 4%**, including a burn of
-0.4% of the gross amount. The supplied `Token.protected.t.sol` test
-`test_transferMovesExactlyWhatItWasAsked` instead requires the recipient to receive the
-entire amount, the sender to lose exactly that amount, and total supply to remain unchanged.
-These requirements cannot both hold for the same transfer.
+`LaunchToken.transfer` and `transferFrom` deduct **400 basis points (4%)** from the
+sent gross amount. For 1,000 GRID, the recipient receives 960 GRID, City Rewards gets
+20, Resource Pot gets 12, 4 is burned, and the fixed treasury receives 4. There are no
+sender/recipient exemptions: claims, funding, self-transfers, treasury transfers, and
+contract transfers all use the same rule. The previous fee-free implementation and
+optional-only tax have been replaced. Old exact-transfer admission checks must be
+updated to the approved fee-on-transfer requirement before release.
 
-This implementation follows the protected launch floor: **LaunchToken is fee-free**.
-There are no exemptions, delayed tax switches, alternative token assets, or test-specific
-behavior. `CityRegistry.transferWithTax` supplies an **optional application route** with the
-requested split; direct `transfer`, `transferFrom`, ordinary DEX trades, and reward claims
-do not collect a tax. Explicit funding methods can also fund both pots. This route does
-**not** fulfill the universal-tax requirement. The workflow or launch admission requirements
-must be reconciled before approving a release. Do not advertise that all trading funds the
-pots, or use the workflow's proposed website tagline as a statement of current behavior.
+`TaxTaken` is emitted by **LaunchToken**, including gross amount and all four shares.
+Both pool shares are credited to the existing registry accounting, backed by its GRID
+balance. Until the one-time registry binding, those shares are escrowed in LaunchToken
+as `pendingRewards` and `pendingResources`; tax is active from the first transfer.
 
 ## Build and check
 
@@ -40,13 +38,14 @@ python3 scripts/export_abi.py --check
 To refresh ABIs after a source change, run `python3 scripts/export_abi.py`.
 The tests cover token supply/allowances/burns; city acquisition/prices; weighted reward
 accounting; resource allocation and levels; heartbeat atomicity; operator and pause
-permissions; fee-route rounding; failed token operations; reentrancy; and CREATE2
+permissions; universal tax and rounding; failed token operations; reentrancy; and CREATE2
 constructor execution, runtime bounds, and prohibited opcodes.
 
 ## Deployment parameters
 
 The intended network is **Sepolia, chain ID 11155111**. No chain transactions have been
-performed. Every constructor is nonpayable and complete; no initialization call is needed.
+performed by this revision. Every constructor is nonpayable. Token transfers are taxed
+immediately, but routing pool revenue requires the one-time binding described below.
 
 | Order | Source / identifier | Constructor arguments |
 | --- | --- | --- |
@@ -57,19 +56,39 @@ performed. Every constructor is nonpayable and complete; no initialization call 
 `LaunchToken` has name **Swarm Cities**, symbol **GRID**, 18 decimals, and mints exactly
 `1000000000000000000000000000` minor units (one billion GRID) once to its constructor
 caller, which is the factory. It has no owner, later minting, upgrade mechanism, pause,
-blocklist, or fee configuration. Holder burns and approved-spender `burnFrom` reduce
-supply; burns emit `Transfer(from, address(0), amount)` and do not credit a zero-address
+blocklist, or adjustable fee. Its deploying address has only a one-time registry-binding
+power; the rate and treasury cannot be changed. Holder burns and approved-spender `burnFrom` reduce
+supply without a transfer tax, preserving city purchase and level-up burns. Burns emit `Transfer(from, address(0), amount)` and do not credit a zero-address
 balance. Application constructors neither move nor burn the factory's launch supply.
 
 The manifest should identify `GrantExecutor` before `CityRegistry`. Registry address
 arguments are `$token` and `$contract:GrantExecutor`, respectively. The executor's
 operator is an explicit address argument, never constructor `msg.sender`.
 
+After both application contracts exist, the **token constructor caller** must call
+`LaunchToken.setCityRegistry(registry)` exactly once. If a factory deploys the token,
+that factory must expose an authorized way to make this call; an EOA cannot substitute
+for it. The caller must verify the reviewed registry bytecode and addresses before
+binding. The setter rejects zero/no-code/self addresses, a different token, or a registry
+whose treasury differs from the approved treasury, and cannot be called a second time.
+Getter checks alone do not authenticate bytecode: selecting the correct registry is a
+trust assumption on the deploying authority. Binding transfers only the recorded pool
+escrow, without another tax, and credits it through the registry callback. Direct donations
+to the token are not included. A failed callback rolls the entire binding back.
+
+Operationally, bind before opening the application or distributing the supply. Before
+binding, transfers and burns work, treasury/burn shares settle immediately, and pool shares
+wait in escrow. There is no alternate withdrawal, delayed tax activation, reconfiguration,
+or recovery mechanism if the deploying factory cannot bind. This additional setup call
+must be supported by the publication/admission service; `launch.json` notes it but does
+not execute it. Existing immutable deployments cannot acquire this behavior through a
+source update; this task authorizes no on-chain migration or deployment.
+
 **The approved operator and treasury are both
-`0x5b95A971B4583A5f011E9DA082acdD679b870D06`.** `CityRegistry` derives its immutable
-treasury from `GrantExecutor.operator()`. Constructors reject zero/missing dependencies
-but do not hard-code that wallet. A different operator parameter would redirect both
-privileged grant access and treasury payments and violate the workflow. If the canonical
+`0x5b95A971B4583A5f011E9DA082acdD679b870D06`.** `LaunchToken.TREASURY` hard-codes this wallet. `CityRegistry` retains its immutable
+`treasury` derived from `GrantExecutor.operator()`, and token binding requires that it
+match. A different operator parameter changes grant authority and prevents binding
+that registry; it never redirects the token treasury. If the canonical
 manifest uses `$owner`, the policy owner must equal this approved address. If it does not,
 that is an unresolved authorization conflict for the manifest reviewer, not permission to
 substitute another wallet. The manifest service must verify the actual encoded arguments.
@@ -96,13 +115,20 @@ for arbitrary rebasing or malicious tokens.
 - Level `n` to `n+1` costs `100 * (n+1)^2` **whole resources**, with maximum level 20.
   Only the city owner can level or claim. A level change settles old rewards before
   changing weight, so the new level earns only subsequent distributions.
-- `fundRewards(amount)` and `fundResources(amount)` debit approved minor GRID units.
-  Direct ERC-20 transfers into the registry do not fund either accounting pool. Such
-  donations remain inaccessible surplus: there is deliberately no administrator sweep.
-- Reward weight is `level^2`. Rewards accrue on funding or the optional fee route,
+- `fundRewards(amount)` and `fundResources(amount)` debit the approved **gross** minor
+  GRID units. They credit the intended pool with the net amount, in addition to the
+  automatic tax shares. For 1,000 GRID funding, reward funding adds 980 rewards and 12
+  resources; resource funding adds 20 rewards and 972 resources. The custody check
+  separately accounts for tax callback credits so they cannot be counted twice.
+  Ordinary direct transfers to the registry credit only their tax shares to the pools;
+  the net recipient amount remains inaccessible surplus with no administrator sweep.
+- Reward weight is `level^2`. Rewards accrue on funding and every taxed transfer,
   independently of heartbeat timing. Funding before any city exists is queued and awarded
   to the first city. Later buyers do not share earlier rewards, apart from tiny global
-  division dust. Claims are fee-free and retain fractional minor-unit credits for later.
+  division dust. Claims debit and report the gross entitlement; their token payout is taxed and the
+  recipient receives the net. The claim tax can create new claimable rewards immediately.
+  Fractional minor-unit credits are retained for later. Claim timing can therefore affect
+  later allocations through those new distributions; the original gross entitlement is preserved.
   Accumulator precision is `1e27`; global remainder is carried into the next distribution.
   Following a weight change, fewer than `102400 / 1e27` minor units of old remainder can
   be shared under the new weights. There is no claim-all loop or owner withdrawal.
@@ -118,23 +144,41 @@ for arbitrary rebasing or malicious tokens.
   have no redemption or recovery path. No operator receives the consumed backing.
 - `rewardsPool` and `resourcePot` are available accounting balances, not separate wallet
   addresses. The registry's token balance covers these two balances plus unspent-resource backing.
-  Forced/direct token donations can increase custody without increasing these balances.
+  Net direct donations can increase custody beyond these balances.
 
-## Optional fee route
+## Rounding and compatibility route
 
-`transferWithTax(to, grossAmount)` requires approval for the full gross amount. The fee
-is `ceil(grossAmount / 25)`; the recipient gets `grossAmount - fee`. Resources receive
-`floor(fee * 3 / 10)`, `floor(fee / 10)` is burned, treasury receives `floor(fee / 10)`,
-and rewards receive the remaining fee, including all split dust (at most three minor
-units above `floor(fee / 2)`). Every positive gross amount pays at least one minor unit;
-rounding up the levy adds less than one minor unit over exactly 4%. The split is exactly
-50/30/10/10 when the fee is divisible by ten. For 1,000 GRID, the result is 960 to the
-recipient, 20 to rewards, 12 to resources, 4 burned, and 4 to treasury. For 24 minor units,
-the recipient receives 23 and rewards receive 1; for a single minor unit, the recipient
-receives zero. Individual burn/resource/treasury shares can round to zero. The frontend
-must show the rounded net and fee. Ordinary ERC-20 transfers still bypass this route.
-Zero amount and zero/registry recipient are rejected. All debits, allocations, burns,
-and sends revert together if an operation fails. There is no ETH fee or ETH entrypoint.
+Tax is `floor(grossAmount * 400 / 10000)`, computed as `grossAmount / 25` without
+multiplication overflow. Resources receive `floor(tax * 3 / 10)`, burn and treasury
+each receive `floor(tax / 10)`, and rewards receive the remainder. This preserves
+`rewards + resources + burned + treasury == tax` for every integer amount; split dust
+belongs to rewards (up to three minor units above `floor(tax / 2)`). The split is exactly
+50/30/10/10 when tax is divisible by ten. Transfers below 25 minor units round to zero
+tax; splitting transfers into dust-sized units can avoid rounded fees. There is no
+minimum fee or rounding up. Zero token transfers succeed and emit a zero-valued tax event.
+Transfers to zero revert; the burn share uses the base ERC-20 burn update, reduces total
+supply, emits `Transfer(from, address(0), burned)`, and never credits the zero address.
+
+`CityRegistry.transferWithTax(to, grossAmount)` remains as a compatibility entrypoint.
+It spends the registry allowance once via token `transferFrom(sender, recipient, gross)`;
+LaunchToken takes the single universal tax and emits `TaxTaken`. It does not pull then
+resend tokens or impose an extra application fee. As before, this registry wrapper
+rejects zero amounts and zero/registry recipients. Direct ERC-20 transfers allow zero
+amounts and transfers to the registry. Allowances are consumed by **gross** spend,
+including self-transfers. OpenZeppelin's unlimited allowance semantics remain unchanged.
+
+When sender or recipient coincides with treasury/registry, its observed balance change
+includes its beneficiary share; gross debit and individual transfer legs remain defined.
+Self-transfers require the entire gross balance even though their net loss is only tax.
+Tax allocation uses base ERC-20 updates, avoiding recursive taxation. All debits, burns,
+allowance consumption and callback accounting revert together on failure. The only token
+callback goes to the permanently bound registry; its token-only `onTaxReceived` performs
+accounting without external calls. It intentionally works during guarded funding/claims.
+
+Integration operators must quote net received amounts and account for fee-on-transfer
+behavior. The existing pool manifest is not evidence that its DEX/router supports GRID;
+confirm fee-on-transfer support before admission or trading. No DEX compatibility or
+on-chain transaction was tested here.
 
 ## Grant operation and responsibility
 
@@ -154,14 +198,16 @@ selects winners off-chain and may make repeated awards while funds remain. That 
 can preferentially allocate resources, indirectly affecting future reward weights.
 
 Only the same operator can pause/unpause executor grants. Buying, funding, leveling,
-optional fee routing, token transfers, and reward claims remain live. There is no general
+the compatibility transfer route, token transfers, and reward claims remain live. There is no general
 emergency pause, key rotation, upgrade, or recovery path; loss of the operator key can
 permanently disable future grants. Current owners retain their claims and city operations.
 
-The source received an additional agent review and adversarial local tests during this
-assignment. This is not the separate contributor review required for release. The final
-independent reviewer must inspect accepted source **and** the generated manifest, confirm
-operator/treasury linkage, and resolve the tax conflict and resource assumptions. Services
-own source publication, signed artifact/policy linkage, admission, deployment, explorer
-verification, and the subsequent frontend/IPFS publication. Those activities are not
-performed here. Slither and Mythril were not run; local Foundry results are not an audit.
+The source and tests received a separate adversarial agent review after implementation;
+see `docs/TRANSFER_TAX_REVIEW.md` for scope and findings. This is not an external audit
+or the contributor network's separate release approval. The release reviewer must inspect
+accepted source and manifest, verify the binding path and operator address, and reconcile
+any remaining admission or DEX compatibility constraints. Services own source publication,
+signed artifact/policy linkage, admission, deployment, explorer verification, and frontend
+publication. The approved operator owns grant selection and key security; the treasury
+recipient controls its received GRID. Slither and Mythril were not run. Foundry validation
+covers local behavior only.
