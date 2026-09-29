@@ -12,6 +12,8 @@ import {GrantExecutor} from "../src/GrantExecutor.sol";
 
 /// @dev Deliberately hostile dependency used to test defensive custody behavior.
 contract HostileGrid is ERC20, ERC20Burnable {
+    error BurnRejected();
+
     CityRegistry public target;
     bytes private callback;
     uint256 public callbackOn;
@@ -19,6 +21,7 @@ contract HostileGrid is ERC20, ERC20Burnable {
     bytes4 public callbackError;
     bool public failPayout;
     bool public shortReceipt;
+    bool public failBurn;
 
     constructor() ERC20("Hostile", "BAD") {
         _mint(msg.sender, 1e27);
@@ -33,6 +36,10 @@ contract HostileGrid is ERC20, ERC20Burnable {
     function setFailure(bool payout, bool receipt) external {
         failPayout = payout;
         shortReceipt = receipt;
+    }
+
+    function setBurnFailure(bool value) external {
+        failBurn = value;
     }
 
     function transfer(address to, uint256 amount) public override returns (bool) {
@@ -52,6 +59,7 @@ contract HostileGrid is ERC20, ERC20Burnable {
     }
 
     function burn(uint256 amount) public override {
+        if (failBurn) revert BurnRejected();
         if (callbackOn == 4) _attempt();
         super.burn(amount);
     }
@@ -84,8 +92,9 @@ contract AdversarialTest is Test {
         registry = new CityRegistry(address(token), address(executor));
         token.transfer(ALICE, 100_000e18);
         token.approve(address(registry), type(uint256).max);
+        uint256 price = registry.cityPrice();
         vm.prank(ALICE);
-        token.approve(address(registry), type(uint256).max);
+        token.approve(address(registry), price);
         vm.prank(ALICE);
         registry.buyCity(0);
     }
@@ -130,8 +139,9 @@ contract AdversarialTest is Test {
     function testReentrantBurnCannotAcquireAdditionalCity() public {
         token.configure(registry, abi.encodeCall(registry.buyCity, (99)), 3);
         token.transfer(BOB, 100_000e18);
+        uint256 price = registry.cityPrice();
         vm.startPrank(BOB);
-        token.approve(address(registry), type(uint256).max);
+        token.approve(address(registry), price);
         registry.buyCity(1);
         vm.stopPrank();
         _assertGuard();
@@ -147,6 +157,73 @@ contract AdversarialTest is Test {
         assertEq(registry.rewardsPool(), 20e18);
         assertEq(registry.resourcePot(), 12e18);
         assertEq(token.balanceOf(address(registry)), 32e18);
+    }
+
+    function testReentrantLevelBurnCannotConsumeResourcesTwice() public {
+        registry.fundResources(1300e18);
+        executor.grantResources(address(registry), 0, 1300);
+        token.configure(registry, abi.encodeCall(registry.levelUp, (0)), 4);
+        uint256 supply = token.totalSupply();
+        vm.prank(ALICE);
+        registry.levelUp(0);
+        _assertGuard();
+        (, uint256 level, uint256 resources,,) = registry.cities(0);
+        assertEq(level, 2);
+        assertEq(resources, 900);
+        assertEq(registry.totalWeight(), 4);
+        assertEq(registry.allocatedResourceBacking(), 900e18);
+        assertEq(token.balanceOf(address(registry)), 900e18);
+        assertEq(token.totalSupply(), supply - 400e18);
+    }
+
+    function testRejectedLevelBurnRestoresResourcesWeightAndRewardCredits() public {
+        registry.fundResources(400e18);
+        executor.grantResources(address(registry), 0, 400);
+        registry.fundRewards(100e18);
+        (,,, uint256 indexBefore, uint256 accruedBefore) = registry.cities(0);
+        uint256 supply = token.totalSupply();
+        token.setBurnFailure(true);
+        vm.expectRevert(HostileGrid.BurnRejected.selector);
+        vm.prank(ALICE);
+        registry.levelUp(0);
+        (, uint256 level, uint256 resources, uint256 index, uint256 accrued) = registry.cities(0);
+        assertEq(level, 1);
+        assertEq(resources, 400);
+        assertEq(index, indexBefore);
+        assertEq(accrued, accruedBefore);
+        assertEq(registry.totalWeight(), 1);
+        assertEq(registry.allocatedResourceBacking(), 400e18);
+        assertEq(registry.resourcePot(), 0);
+        assertEq(registry.claimableRewards(0), 100e18);
+        assertEq(registry.rewardsPool(), 100e18);
+        assertEq(token.balanceOf(address(registry)), 500e18);
+        assertEq(token.totalSupply(), supply);
+        token.setBurnFailure(false);
+        vm.prank(ALICE);
+        registry.levelUp(0);
+        assertEq(registry.allocatedResourceBacking(), 0);
+        assertEq(registry.totalWeight(), 4);
+        assertEq(registry.claimableRewards(0), 100e18);
+        assertEq(token.balanceOf(address(registry)), 100e18);
+        assertEq(token.totalSupply(), supply - 400e18);
+    }
+
+    function testRejectedRoundedTaxBurnRestoresPayoutPoolsAndAllowance() public {
+        uint256 balance = token.balanceOf(address(this));
+        uint256 supply = token.totalSupply();
+        token.approve(address(registry), 226);
+        token.setBurnFailure(true);
+        vm.expectRevert(HostileGrid.BurnRejected.selector);
+        registry.transferWithTax(BOB, 226);
+        assertEq(token.balanceOf(address(this)), balance);
+        assertEq(token.balanceOf(BOB), 0);
+        assertEq(token.balanceOf(address(registry)), 0);
+        assertEq(token.totalSupply(), supply);
+        assertEq(token.allowance(address(this), address(registry)), 226);
+        assertEq(registry.rewardsPool(), 0);
+        assertEq(registry.resourcePot(), 0);
+        assertEq(registry.claimableRewards(0), 0);
+        assertEq(registry.accRewardPerWeight(), 0);
     }
 
     function testShortReceiptCannotCreateUnbackedRewards() public {

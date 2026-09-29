@@ -14,8 +14,10 @@ requiring 400 GRID backing; it does not mean 400 token wei.
 Standard ERC-20 getters, `transfer`, `approve`, and `transferFrom` are fee-free.
 `burn(amount)` burns the caller's balance; `burnFrom(account, amount)` requires that
 account's allowance to the caller. No constructor arguments or administrative methods.
-Infinite ERC-20 allowances are supported; applications should request the exact intended
-spend. Zero ERC-20 transfers are allowed and zero-address recipients are rejected.
+Applications must request the exact intended spend. In particular, never request an
+unlimited or oversized CityRegistry purchase allowance: it permits a higher live price
+to be burned after intervening buys. Zero ERC-20 transfers are allowed and zero-address
+recipients are rejected.
 
 ## CityRegistry reads
 
@@ -28,7 +30,7 @@ spend. Zero ERC-20 transfers are allowed and zero-address recipients are rejecte
 | `levelUpCost(cityId)` | Whole resources required for the next level; empty/max-level plots revert |
 | `claimableRewards(cityId)` | Current whole minor units claimable; empty valid plot returns zero |
 | `rewardsPool()`, `resourcePot()` | Unpaid reward reserve and unallocated resource backing, respectively |
-| `allocatedResourceBacking()` | Permanently locked GRID for previously granted resources |
+| `allocatedResourceBacking()` | GRID backing unspent granted resources; decreases when leveling burns the backing |
 | `soldPlots()`, `totalWeight()` | Occupied count and sum of squared levels |
 | `token()`, `grantExecutor()`, `treasury()` | Immutable dependency and beneficiary addresses |
 | `heartbeatCount()`, `lastHeartbeatTimestamp()` | Last sequence/time; count zero means no heartbeat yet |
@@ -43,8 +45,8 @@ NFT interface exists. Built-in fixed-array getters reject indexes outside their 
 
 | Method | Caller / preconditions |
 | --- | --- |
-| `buyCity(cityId)` | Unowned plot, caller has no city, >=1,000 GRID held, sufficient balance and allowance for full price |
-| `levelUp(cityId)` | Owner, below level 20, enough whole resources |
+| `buyCity(cityId)` | Unowned plot, caller has no city, >=1,000 GRID held; approve exactly the accepted quote to cap the burn |
+| `levelUp(cityId)` | Owner, below level 20, enough whole resources; consumes resources and burns their GRID backing atomically |
 | `claimRewards(cityId)` | Owner, at least one minor GRID unit accrued; returns amount paid |
 | `fundRewards(amount)` | Any caller with balance/allowance; amount positive |
 | `fundResources(amount)` | Any caller with balance/allowance; amount positive |
@@ -54,6 +56,24 @@ NFT interface exists. Built-in fixed-array getters reject indexes outside their 
 
 Approvals for buys/funding/optional transfers name **CityRegistry** as spender.
 Approvals are not needed for claims, leveling, or executor awards.
+
+The frontend purchase flow is: read `cityPrice()`, display that exact minor-unit quote,
+obtain the buyer's acceptance, and call `token.approve(registry, quote)` even if an
+existing allowance exceeds the quote. Wait for confirmation before `buyCity(cityId)`.
+Do not use `increaseAllowance`, add a buffer, or retain an unlimited allowance. If another
+buy raises the price, the burn reverts with `ERC20InsufficientAllowance`, preserving the
+buyer's balance and allowance and all city/reward state. Show the new quote and obtain
+fresh acceptance before replacing the allowance and retrying. On success the exact
+allowance is consumed. If the buyer cancels or a purchase fails for another reason,
+offer to revoke the remaining allowance with `approve(registry, 0)`. `buyCity` has no
+separate price-limit parameter; the allowance supplies that limit. The frontend is a
+subsequent service deliverable and must implement this flow before release.
+
+For `transferWithTax`, show `fee = ceil(amount / 25)` and `net = amount - fee` before
+approval. Resources receive `floor(3 * fee / 10)`, burn and treasury each receive
+`floor(fee / 10)`, and rewards receive the remainder. A one-minor-unit gross amount
+delivers zero net. `TaxTaken` reports all rounded amounts. This optional route does not
+resolve the universal-tax release conflict described in README.
 
 ## GrantExecutor
 

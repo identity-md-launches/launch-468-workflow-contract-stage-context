@@ -87,8 +87,12 @@ for arbitrary rebasing or malicious tokens.
 - A buyer must hold at least 1,000 GRID before payment and also afford the full price.
   The price is `10000 * 1e18 * (256 + soldPlots)^2 / 65536`, rounded down only at the
   final division into minor units. The first city costs 10,000 GRID. Approve the registry
-  for the current price; `buyCity(id)` burns that full price and starts level 1, resources 0.
-  An intervening purchase raises the price; an exact allowance makes a stale quote revert.
+  for **exactly the displayed and accepted quote**; `buyCity(id)` burns the live price and
+  starts level 1, resources 0. An intervening purchase raises the price; an exact allowance
+  makes a stale quote revert. An oversized or unlimited allowance permits a higher burn.
+  The frontend must replace any existing allowance with the exact quote, wait for that
+  approval to confirm, and never silently increase it after a stale-quote failure. Display
+  and obtain acceptance of a fresh quote before retrying. See `docs/ABI.md` for the flow.
 - Level `n` to `n+1` costs `100 * (n+1)^2` **whole resources**, with maximum level 20.
   Only the city owner can level or claim. A level change settles old rewards before
   changing weight, so the new level earns only subsequent distributions.
@@ -103,24 +107,32 @@ for arbitrary rebasing or malicious tokens.
   Following a weight change, fewer than `102400 / 1e27` minor units of old remainder can
   be shared under the new weights. There is no claim-all loop or owner withdrawal.
 - One granted resource allocates **one GRID (1e18 minor units)** from the resource pot.
-  Fractional GRID below one resource waits for further funding. Allocated GRID stays
-  permanently locked in the registry as `allocatedResourceBacking`, including after
-  leveling consumes resources. Resources cannot be redeemed, transferred, or regranted.
-  This is an explicit interpretation of the workflow's unspecified resource conversion
-  and custody semantics; it creates no extra GRID burns or privileged withdrawals.
+  Fractional GRID below one resource waits for further funding. `allocatedResourceBacking`
+  covers unspent resources. When leveling consumes resources, the registry burns the
+  corresponding GRID and reduces that backing atomically. A failed burn reverts the level,
+  resource, weight, and reward-credit changes. Individual and heartbeat grants use the
+  same accounting; granting alone does not burn. Resources cannot be redeemed, transferred,
+  or regranted. This revision resolves spent-resource custody by burning on consumption:
+  reaching level 20 consumes and burns 286,900 resources/GRID per city, in addition to its
+  purchase burn. Unspent grants (including excess grants at level 20) retain backing and
+  have no redemption or recovery path. No operator receives the consumed backing.
 - `rewardsPool` and `resourcePot` are available accounting balances, not separate wallet
-  addresses. The registry's token balance covers these two balances plus locked backing.
+  addresses. The registry's token balance covers these two balances plus unspent-resource backing.
   Forced/direct token donations can increase custody without increasing these balances.
 
 ## Optional fee route
 
 `transferWithTax(to, grossAmount)` requires approval for the full gross amount. The fee
-is `floor(grossAmount / 25)`, the recipient gets `grossAmount - fee`, rewards receive
-`floor(fee / 2)`, resources receive `floor(fee * 3 / 10)`, and `floor(fee / 10)` is burned.
-Treasury receives the remaining fee, including rounding dust. For 1,000 GRID, the result
-is 960 to the recipient, 20 to rewards, 12 to resources, 4 burned, and 4 to treasury.
-Amounts are minor units; amounts below 25 minor units round to zero fee. Splitting
-transfers can avoid tiny rounded fees, so this path is not an enforcement mechanism.
+is `ceil(grossAmount / 25)`; the recipient gets `grossAmount - fee`. Resources receive
+`floor(fee * 3 / 10)`, `floor(fee / 10)` is burned, treasury receives `floor(fee / 10)`,
+and rewards receive the remaining fee, including all split dust (at most three minor
+units above `floor(fee / 2)`). Every positive gross amount pays at least one minor unit;
+rounding up the levy adds less than one minor unit over exactly 4%. The split is exactly
+50/30/10/10 when the fee is divisible by ten. For 1,000 GRID, the result is 960 to the
+recipient, 20 to rewards, 12 to resources, 4 burned, and 4 to treasury. For 24 minor units,
+the recipient receives 23 and rewards receive 1; for a single minor unit, the recipient
+receives zero. Individual burn/resource/treasury shares can round to zero. The frontend
+must show the rounded net and fee. Ordinary ERC-20 transfers still bypass this route.
 Zero amount and zero/registry recipient are rejected. All debits, allocations, burns,
 and sends revert together if an operation fails. There is no ETH fee or ETH entrypoint.
 

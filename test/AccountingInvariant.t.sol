@@ -28,8 +28,6 @@ contract CityAccountingHandler is Test {
             address actor = address(uint160(0xAC7000 + i));
             actors[i] = actor;
             token.transfer(actor, 20_000_000 ether);
-            vm.prank(actor);
-            token.approve(address(registry), type(uint256).max);
         }
     }
 
@@ -41,8 +39,10 @@ contract CityAccountingHandler is Test {
         if (token.balanceOf(actor) < price) return;
         // Each actor has its own 32-plot interval; this still exercises different city IDs.
         uint256 cityId = actorIndex * 32 + plotSeed % 32;
-        vm.prank(actor);
+        vm.startPrank(actor);
+        token.approve(address(registry), price);
         registry.buyCity(cityId);
+        vm.stopPrank();
         totalBurned += price;
     }
 
@@ -50,16 +50,20 @@ contract CityAccountingHandler is Test {
         address actor = actors[actorSeed % ACTOR_COUNT];
         uint256 amount = _fundingAmount(actor, amountSeed);
         if (amount == 0) return;
-        vm.prank(actor);
+        vm.startPrank(actor);
+        token.approve(address(registry), amount);
         registry.fundRewards(amount);
+        vm.stopPrank();
     }
 
     function fundResources(uint256 actorSeed, uint256 amountSeed) external {
         address actor = actors[actorSeed % ACTOR_COUNT];
         uint256 amount = _fundingAmount(actor, amountSeed);
         if (amount == 0) return;
-        vm.prank(actor);
+        vm.startPrank(actor);
+        token.approve(address(registry), amount);
         registry.fundResources(amount);
+        vm.stopPrank();
     }
 
     function taxedTransfer(uint256 fromSeed, uint256 toSeed, uint256 amountSeed) external {
@@ -67,9 +71,11 @@ contract CityAccountingHandler is Test {
         address to = actors[toSeed % ACTOR_COUNT];
         uint256 amount = _fundingAmount(from, amountSeed);
         if (amount == 0) return;
-        vm.prank(from);
+        vm.startPrank(from);
+        token.approve(address(registry), amount);
         registry.transferWithTax(to, amount);
-        totalBurned += (amount / 25) / 10;
+        vm.stopPrank();
+        totalBurned += ((amount + 24) / 25) / 10;
     }
 
     function grant(uint256 actorSeed, uint256 amountSeed) external {
@@ -105,6 +111,7 @@ contract CityAccountingHandler is Test {
         vm.prank(actor);
         registry.levelUp(cityId);
         totalConsumedResources += cost;
+        totalBurned += cost * 1 ether;
     }
 
     function claim(uint256 actorSeed) external {
@@ -231,13 +238,13 @@ contract AccountingInvariantTest is Test {
         );
         assertEq(
             registry.allocatedResourceBacking(),
-            handler.totalGrantedResources() * 1 ether,
-            "every granted resource remains backed after leveling"
+            resources * 1 ether,
+            "only unspent resources retain GRID backing"
         );
         assertEq(
             token.totalSupply() + handler.totalBurned(),
             handler.INITIAL_SUPPLY(),
-            "only purchases and the explicit levy burn supply"
+            "purchases, the explicit levy and resource consumption account for every burn"
         );
     }
 }

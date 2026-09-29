@@ -241,8 +241,8 @@ contract CityRegistryTest is Test {
         _fundRewards(100e18);
         _claim(ALICE, 0, 130e18);
         _claim(BOB, 1, 70e18);
-        assertEq(registry.allocatedResourceBacking(), 400e18);
-        assertEq(token.balanceOf(address(registry)), 400e18);
+        assertEq(registry.allocatedResourceBacking(), 0);
+        assertEq(token.balanceOf(address(registry)), 0);
         _assertBacking();
     }
 
@@ -312,7 +312,7 @@ contract CityRegistryTest is Test {
         assertEq(registry.claimableRewards(0), 5e18);
     }
 
-    function testResourcesAllocateWholeGridBackingAndRemainLockedAfterLeveling() public {
+    function testResourcesAllocateWholeGridBackingAndBurnItOnLeveling() public {
         _buy(ALICE, 0);
         _fundResources(500e18 + 7);
         vm.expectEmit(true, false, false, true, address(registry));
@@ -322,15 +322,17 @@ contract CityRegistryTest is Test {
         assertEq(registry.allocatedResourceBacking(), 400e18);
         assertEq(token.balanceOf(address(registry)), 500e18 + 7);
         assertEq(registry.levelUpCost(0), 400);
+        uint256 supplyBefore = token.totalSupply();
         vm.prank(ALICE);
         vm.expectEmit(true, false, false, true, address(registry));
         emit CityLeveled(0, 2, 400);
         registry.levelUp(0);
         _assertCity(0, ALICE, 2, 0);
         assertEq(registry.resourcePot(), 100e18 + 7);
-        assertEq(registry.allocatedResourceBacking(), 400e18);
+        assertEq(registry.allocatedResourceBacking(), 0);
         assertEq(token.balanceOf(ALICE), 0);
-        assertEq(token.balanceOf(address(registry)), 500e18 + 7);
+        assertEq(token.balanceOf(address(registry)), 100e18 + 7);
+        assertEq(token.totalSupply(), supplyBefore - 400e18);
         _assertBacking();
     }
 
@@ -369,6 +371,7 @@ contract CityRegistryTest is Test {
         }
         _fundResources(totalCost * 1e18);
         _grant(0, totalCost);
+        uint256 supplyBefore = token.totalSupply();
         for (uint256 next = 2; next <= 20; ++next) {
             assertEq(registry.levelUpCost(0), 100 * next * next);
             vm.prank(ALICE);
@@ -381,7 +384,8 @@ contract CityRegistryTest is Test {
         registry.levelUp(0);
         vm.expectRevert(CityRegistry.MaximumLevel.selector);
         registry.levelUpCost(0);
-        assertEq(registry.allocatedResourceBacking(), totalCost * 1e18);
+        assertEq(registry.allocatedResourceBacking(), 0);
+        assertEq(token.totalSupply(), supplyBefore - totalCost * 1e18);
         assertEq(registry.resourcePot(), 0);
         _assertBacking();
     }
@@ -607,23 +611,29 @@ contract CityRegistryTest is Test {
     }
 
     function testFuzzTaxRoundingConservesGrossDebit(uint256 rawAmount) public {
-        uint256 amount = bound(rawAmount, 1, 1_000_000e18);
+        uint256 amount = bound(rawAmount, 1, token.totalSupply());
         uint256 supplyBefore = token.totalSupply();
         uint256 senderBefore = token.balanceOf(address(this));
         token.approve(address(registry), amount);
         registry.transferWithTax(BOB, amount);
-        uint256 fee = amount / 25;
+        uint256 fee = (amount + 24) / 25;
         uint256 burned = fee / 10;
         uint256 recipient = token.balanceOf(BOB);
         uint256 treasuryAmount = token.balanceOf(OPERATOR);
         uint256 retained = token.balanceOf(address(registry));
         assertEq(senderBefore - token.balanceOf(address(this)), amount);
         assertEq(recipient, amount - fee);
-        assertEq(registry.rewardsPool(), fee / 2);
+        assertGt(fee, 0);
+        assertLe(fee, amount);
+        assertGe(fee * 25, amount);
+        assertLt(fee * 25 - amount, 25);
+        assertGe(registry.rewardsPool(), fee / 2);
+        assertLe(registry.rewardsPool() - fee / 2, 3);
         assertEq(registry.resourcePot(), fee * 3 / 10);
         assertEq(token.totalSupply(), supplyBefore - burned);
         assertEq(recipient + treasuryAmount + retained + burned, amount);
-        assertEq(treasuryAmount, fee - fee / 2 - fee * 3 / 10 - burned);
+        assertEq(treasuryAmount, fee / 10);
+        assertEq(registry.rewardsPool() + registry.resourcePot() + burned + treasuryAmount, fee);
         assertEq(token.allowance(address(this), address(registry)), 0);
         _assertBacking();
     }
@@ -648,7 +658,7 @@ contract CityRegistryTest is Test {
         assertLe(aliceAmount + bobAmount, first + second);
         assertLe(registry.rewardsPool(), 1);
         assertEq(registry.rewardsPool(), first + second - aliceAmount - bobAmount);
-        assertEq(registry.allocatedResourceBacking(), 400e18);
+        assertEq(registry.allocatedResourceBacking(), 0);
         _assertBacking();
     }
 
