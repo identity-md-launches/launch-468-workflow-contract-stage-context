@@ -1,0 +1,26 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Swarm Cities",
+    "symbol": "GRID",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "GrantExecutor",
+      "constructorArgs": ["$owner"]
+    },
+    {
+      "contract": "CityRegistry",
+      "constructorArgs": ["$token", "$contract:GrantExecutor"]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Swarm Cities targets Sepolia with a hookless native-ETH pool. LaunchToken takes no constructor arguments. Deploy GrantExecutor before CityRegistry; both application contracts are fully configured by their nonpayable constructors and require no initialization calls. Policy resolves $owner to the immutable GrantExecutor operator, which CityRegistry also uses as its immutable treasury. The resolved policy owner must match the operator and treasury approved in the workflow; that policy value is not established by this manifest and remains an authorization check for review and admission. The accepted LaunchToken has fee-free ERC-20 transfers. Only CityRegistry.transferWithTax applies the optional 4% fee and its 50/30/10/10 rewards/resource/burn/treasury split; ordinary transfers and trades do not fund the pots. This does not satisfy the workflow's universal transfer-tax requirement, which conflicts with the protected exact-transfer check and remains an unresolved release finding. The stated initialPrice is decimal sqrtPriceX96; services derive the effective opening price when the pinned policy specifies an opening market capitalization. Independent review remains a separate contributor assignment. Services own subsequent source publication, signed artifact linkage, policy admission and deployment."
+}
