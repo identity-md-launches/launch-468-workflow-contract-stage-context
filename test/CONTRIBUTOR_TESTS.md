@@ -24,6 +24,18 @@ exhausts the grant pot, and verifies that burning allocated backing does not mak
 available for a second grant or heartbeat. Reaching level 20 consumes exactly 286,900
 resources. The reward oracle and its one-minor-unit rounding tolerance are unchanged.
 
+`FullGridLimits.t.sol` drives the registry to its largest reachable state: all 256 plots
+sold and every city at level 20, the maximum reward weight of 102,400. There it checks that
+the grid is closed to every purchase, quote and upgrade, that one wei of funding rounds to
+nothing for every city with no remainder, that funding exactly the weight in wei pays each
+city exactly its level squared, and that the entire remaining supply splits equally within
+one wei per city and is claimed in full. It pins grants to a level-20 city as accepted but
+unusable with their backing kept in custody, self-transfers and the treasury as recipients
+on the explicit levy route, the executor-wide scope of pause across two registries, and
+forwarding to a contract that is not a registry. Two fuzz properties cover the coordinate
+round-trip across the grid walk and equal shares for equal levels at every level and
+funding size.
+
 Run without writing build artifacts outside the permitted scratch directory:
 
 ```sh
