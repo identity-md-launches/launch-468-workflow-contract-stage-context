@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/OpenZeppelin/openzeppelin-contracts",
+  "tag": "v5.1.0",
+  "archive_url": "https://codeload.github.com/OpenZeppelin/openzeppelin-contracts/tar.gz/refs/tags/v5.1.0",
+  "archive_sha256": "8a3b08cfc756437ba3343901565b18182adb42ec1e621960240a19da5d738686",
+  "vendored_files": 15
+}
