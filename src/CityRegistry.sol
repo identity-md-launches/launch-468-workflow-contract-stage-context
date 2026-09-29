@@ -38,7 +38,7 @@ contract CityRegistry is ReentrancyGuard {
     uint256 public totalWeight;
     uint256 public rewardsPool;
     uint256 public resourcePot;
-    /// @notice GRID permanently allocated to granted resources, including resources later spent.
+    /// @notice GRID backing unspent granted resources; burned as leveling consumes those resources.
     uint256 public allocatedResourceBacking;
     uint256 public accRewardPerWeight;
     uint256 public rewardRemainder;
@@ -111,7 +111,8 @@ contract CityRegistry is ReentrancyGuard {
         return 10_000 * GRID_UNIT * n * n / 65_536;
     }
 
-    /// @notice Approve this registry for the quoted price before buying. Payment is burned in full.
+    /// @notice Approve exactly the displayed quote; a stale quote then reverts. Payment is burned in full.
+    /// @dev An oversized allowance permits burning the higher live price after intervening purchases.
     function buyCity(uint256 cityId) external nonReentrant {
         _validId(cityId);
         City storage city = cities[cityId];
@@ -150,9 +151,14 @@ contract CityRegistry is ReentrancyGuard {
         if (city.resources < cost) revert InsufficientResources();
         _settle(city);
         city.resources -= cost;
+        uint256 backing = cost * GRID_UNIT;
+        allocatedResourceBacking -= backing;
         totalWeight += 2 * city.level + 1;
         ++city.level;
         emit CityLeveled(cityId, city.level, cost);
+        // Consumed resources no longer require custody; a failed burn rolls back the entire level change.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
+        IGridToken(address(token)).burn(backing);
     }
 
     function claimableRewards(uint256 cityId) public view returns (uint256) {
@@ -188,18 +194,19 @@ contract CityRegistry is ReentrancyGuard {
         emit PoolsFunded(msg.sender, 0, amount);
     }
 
-    /// @notice Opt-in transfer route only: gross debit, 96% net, 4% levy split 50/30/10/10.
-    /// @dev Integer dust from splitting the fee goes to treasury. Ordinary ERC-20 transfers bypass this route.
+    /// @notice Opt-in transfer route: 4% levy rounded up, split 50/30/10/10 with split dust to rewards.
+    /// @dev Every positive amount pays a fee. Ordinary ERC-20 transfers bypass this route.
     function transferWithTax(address to, uint256 amount) external nonReentrant {
         if (to == address(0) || to == address(this)) revert InvalidRecipient();
         _pull(amount);
-        uint256 fee = amount / 25;
-        uint256 rewards = fee / 2;
+        // _pull rejects zero. This ceiling avoids overflowing amount + 24.
+        uint256 fee = (amount - 1) / 25 + 1;
         // Split the already-rounded fee, rather than independently rounding gross percentages.
         // forge-lint: disable-next-line(divide-before-multiply)
         uint256 resources = fee * 3 / 10;
         uint256 burned = fee / 10;
-        uint256 treasuryAmount = fee - rewards - resources - burned;
+        uint256 treasuryAmount = fee / 10;
+        uint256 rewards = fee - resources - burned - treasuryAmount;
         rewardsPool += rewards;
         resourcePot += resources;
         _distribute(rewards);
